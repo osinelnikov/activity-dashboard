@@ -101,7 +101,7 @@ test('a session record round-trips and renders in every format', async () => {
 test('report arguments and paths are parsed', async () => {
   expect(parseReportArgs(['pdf', 'all', '~/Desktop'])).toEqual({ kind: 'pdf', target: 'all', dir: '~/Desktop' })
   expect(parseReportArgs(['md', 'abcd1234'])).toEqual({ kind: 'md', target: 'abcd1234' })
-  expect(parseReportArgs(['./out/'])).toEqual({ kind: 'pdf', target: '', dir: './out/' })
+  expect(parseReportArgs(['./out/'])).toEqual({ kind: 'md', target: '', dir: './out/' })
   expect(isPathLike('abcd1234')).toBe(false)
   expect(expandPath('~/Desktop', '/Users/me', '/work')).toBe('/Users/me/Desktop')
   expect(expandPath('reports', '/Users/me', '/work')).toBe('/work/reports')

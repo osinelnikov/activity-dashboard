@@ -14,9 +14,9 @@ export type ReportKind = 'pdf' | 'html' | 'md'
 
 export type ReportArgs = { kind: ReportKind; target: string; dir?: string }
 
-/** `report [pdf|html|md] [all|<id>] [<folder>]` in any order. */
+/** `report [md|pdf|html] [all|<id>] [<folder>]` in any order; markdown unless a kind is named. */
 export const parseReportArgs = (rest: readonly string[]): ReportArgs => {
-  const out: ReportArgs = { kind: 'pdf', target: '' }
+  const out: ReportArgs = { kind: 'md', target: '' }
   for (const r of rest) {
     const low = r.toLowerCase()
     if (low === 'pdf' || low === 'html' || low === 'md') out.kind = low

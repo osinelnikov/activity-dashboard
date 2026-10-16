@@ -445,19 +445,39 @@ const makeReport = async ($: EngineInterface, kind: ReportKind, target: string, 
     title = `Activity report: ${rec.title}`
   }
   const reports = chosen
-  const mdPath = `${reports}/${stem}.md`
-  const htmlPath = `${reports}/${stem}.html`
+  const stemPath = `${reports}/${stem}`
+  if (kind === 'md') {
+    await $.fs.write(`${stemPath}.md`, md)
+    return `Report written: ${stemPath}.md`
+  }
+  if (kind === 'html') {
+    await $.fs.write(`${stemPath}.html`, html)
+    return `Report written: ${stemPath}.html`
+  }
+  // pdf: the html and the text it is printed from live in the mod's work folder and go once the pdf exists
+  const work = `${dir}/.work`
+  const htmlPath = `${work}/${stem}.html`
+  const mdPath = `${work}/${stem}.md`
+  const pdfPath = `${stemPath}.pdf`
   await $.fs.write(mdPath, md)
   await $.fs.write(htmlPath, html)
-  if (kind === 'md') return `Report written: ${mdPath}`
-  if (kind === 'html') return `Report written: ${htmlPath} (markdown beside it)`
-  const pdfPath = `${reports}/${stem}.pdf`
   const out = await toPdf($, htmlPath, mdPath, pdfPath, title, `${dir}/.browser-profile`)
   if (out.path) {
+    await removeFiles($, [htmlPath, mdPath])
     $.ui.toast(`PDF report: ${out.path}`)
-    return `PDF report written: ${out.path} (via ${out.via}; HTML and markdown beside it)`
+    return `PDF report written: ${out.path} (via ${out.via})`
   }
-  return `Could not render a PDF: ${out.reason}. The HTML report is at ${htmlPath}; open it in a browser and print to PDF.`
+  await $.fs.write(`${stemPath}.html`, html)
+  await removeFiles($, [htmlPath, mdPath])
+  return `Could not render a PDF: ${out.reason}. The HTML report is at ${stemPath}.html; open it in a browser and print to PDF.`
+}
+
+const removeFiles = async ($: EngineInterface, files: string[]) => {
+  try {
+    await $.process.run(['rm', '-f', ...files], { timeoutMs: 5000 })
+  } catch {
+    // leftovers in the work folder do no harm
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -557,7 +577,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: COMMAND,
       description: 'Activity dashboard: live model, agents, orchestration, time, tokens, cost; summary and PDF reports',
-      argumentHint: '[summary|sessions|report [pdf|html|md] [all|<id>] [<folder>]|reportdir [<folder>]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
+      argumentHint: '[summary|sessions|report [md|pdf|html] [all|<id>] [<folder>]|reportdir [<folder>]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
     })
     const now = await $.clock.now()
     const model = await learnSession($)

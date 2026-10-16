@@ -43,7 +43,7 @@ with the keyboard focus. Arguments:
 | --------------------------------- | ---------------------------------------------------------------------- |
 | `summary`                         | prints this chat's summary into the chat: time, tokens, cost, agents, tools |
 | `sessions`                        | lists every recorded chat with its task, time, tokens and cost         |
-| `report [pdf\|html\|md] [all\|<id>] [<folder>]` | writes a report (PDF by default) for this chat, one by id, or all chats; asks for the folder unless one is given |
+| `report [md\|pdf\|html] [all\|<id>] [<folder>]` | writes one report file (Markdown unless `pdf` or `html` is named) for this chat, one by id, or all chats; asks for the folder unless one is given |
 | `reportdir [<folder>]`            | shows the report folders, or makes `<folder>` the first offer           |
 | `title <text>`                    | names the task this chat is about (otherwise the first prompt is used) |
 | `reset`                           | clears every counter                                                   |
@@ -74,7 +74,8 @@ phases need not add up to the wall time. Cost is the host's own ledger.
 
 ## Where reports go
 
-Each report is `<folder>/<date>_<id>.{md,html,pdf}`. When you ask for one, a
+A report is one file, `<folder>/<date>_<id>.md` by default, `.pdf` or `.html` when
+asked for. When you ask for one, a
 dialog offers up to four folders — the one you chose last time, the default,
 the project's `reports/` and your Desktop — and "Other" takes any path (`~`
 allowed). A folder given on the command line skips the dialog:
@@ -86,11 +87,12 @@ be asked, so the default is used.
 
 ## PDF
 
-The PDF is rendered from the HTML report by a headless browser found at one of
+`report pdf` renders the HTML version (kept in the mod's work folder only while
+printing) with a headless browser found at one of
 the usual paths (Google Chrome, Chromium, Microsoft Edge, Brave on macOS or
 Linux), or at the path in `ACTIVITY_DASHBOARD_CHROME`. Without one, macOS's
 `cupsfilter` renders the markdown as plain text. Without either, the HTML report
-is still written and can be printed to PDF from any browser.
+is written in the PDF's place and can be printed to PDF from any browser.
 
 ## Sections of the pane
 
