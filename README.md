@@ -43,7 +43,8 @@ with the keyboard focus. Arguments:
 | --------------------------------- | ---------------------------------------------------------------------- |
 | `summary`                         | prints this chat's summary into the chat: time, tokens, cost, agents, tools |
 | `sessions`                        | lists every recorded chat with its task, time, tokens and cost         |
-| `report [pdf\|html\|md] [all\|<id>]` | writes a report (PDF by default) for this chat, one by id, or all chats |
+| `report [pdf\|html\|md] [all\|<id>] [<folder>]` | writes a report (PDF by default) for this chat, one by id, or all chats; asks for the folder unless one is given |
+| `reportdir [<folder>]`            | shows the report folders, or makes `<folder>` the first offer           |
 | `title <text>`                    | names the task this chat is about (otherwise the first prompt is used) |
 | `reset`                           | clears every counter                                                   |
 | `close`                           | closes the pane                                                        |
@@ -56,8 +57,7 @@ While the pane has the keyboard (ctrl+x tab, or a click), the hotkeys `p`
 ## What is recorded
 
 At the end of every turn the mod writes `~/.claude/activity-dashboard/sessions/<session id>.json`
-(override the home with `ACTIVITY_DASHBOARD_HOME`). Reports go to
-`~/.claude/activity-dashboard/reports/<date>_<id>.{md,html,pdf}`. A record holds:
+(override the home with `ACTIVITY_DASHBOARD_HOME`). A record holds:
 
 - the task title, session id, project folder, repository and branch, session model;
 - wall time and active time, and **where the time went**: model requests of the
@@ -71,6 +71,18 @@ At the end of every turn the mod writes `~/.claude/activity-dashboard/sessions/<
 
 Subagent time overlaps the main loop when agents run in the background, so the
 phases need not add up to the wall time. Cost is the host's own ledger.
+
+## Where reports go
+
+Each report is `<folder>/<date>_<id>.{md,html,pdf}`. When you ask for one, a
+dialog offers up to four folders — the one you chose last time, the default,
+the project's `reports/` and your Desktop — and "Other" takes any path (`~`
+allowed). A folder given on the command line skips the dialog:
+`/activity-dashboard report pdf ~/Desktop`. Two settings in `/config` under
+the plugin: **Report folder** sets the default (empty means
+`~/.claude/activity-dashboard/reports`), and **Ask for the report folder** off
+makes every report go to the default without asking. In a `-p` run nobody can
+be asked, so the default is used.
 
 ## PDF
 

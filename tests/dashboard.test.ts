@@ -3,6 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { DashActiveTool, DashTool, DashTurn } from '../types'
 import { buildRecord, chatSummary, parseRecord, recordToHtml, recordToMarkdown } from '../hooks/report'
 import type { Snapshot } from '../hooks/report'
+import { expandPath, isPathLike, labelPath, parseReportArgs } from '../hooks/paths'
 
 const PANE_PROPS = {
   title: 'Activity',
@@ -95,4 +96,15 @@ test('a session record round-trips and renders in every format', async () => {
   expect(chat).toContain('**TIME**')
   expect(chat).toContain('**COST** $0.170')
   expect(chat).toContain('LONGEST TURN')
+})
+
+test('report arguments and paths are parsed', async () => {
+  expect(parseReportArgs(['pdf', 'all', '~/Desktop'])).toEqual({ kind: 'pdf', target: 'all', dir: '~/Desktop' })
+  expect(parseReportArgs(['md', 'abcd1234'])).toEqual({ kind: 'md', target: 'abcd1234' })
+  expect(parseReportArgs(['./out/'])).toEqual({ kind: 'pdf', target: '', dir: './out/' })
+  expect(isPathLike('abcd1234')).toBe(false)
+  expect(expandPath('~/Desktop', '/Users/me', '/work')).toBe('/Users/me/Desktop')
+  expect(expandPath('reports', '/Users/me', '/work')).toBe('/work/reports')
+  expect(expandPath('/tmp/x/', '/Users/me', '/work')).toBe('/tmp/x')
+  expect(labelPath('/Users/me/.claude/activity-dashboard/reports', '/Users/me')).toBe('~/.claude/activity-dashboard/reports')
 })

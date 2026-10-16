@@ -44,6 +44,8 @@ import {
   total,
   untilIso,
 } from './format'
+import { expandPath, labelPath, parseReportArgs } from './paths'
+import type { ReportKind } from './paths'
 import { aggregateToHtml, aggregateToMarkdown, buildRecord, chatSummary, parseRecord, recordToHtml, recordToMarkdown } from './report'
 import type { Snapshot } from './report'
 
@@ -266,6 +268,94 @@ const loadRecords = async ($: EngineInterface): Promise<SessionRecord[]> => {
 }
 
 // ---------------------------------------------------------------------------
+// Where a report goes: a folder argument, else a dialog (remembered), else the default
+// ---------------------------------------------------------------------------
+
+/** The manifest's userConfig, as `register` received it; a reload brings new values. */
+let config: { reportDir: string; askReportDir: boolean } = { reportDir: '', askReportDir: true }
+
+const STORE_LAST_DIR = 'reportDir:last'
+
+const homeDir = async ($: EngineInterface): Promise<string> => {
+  try {
+    return (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? (await $.session.cwd())
+  } catch {
+    return $.session.cwd()
+  }
+}
+
+const defaultReportDir = async ($: EngineInterface): Promise<string> => {
+  if (config.reportDir.trim()) return expandPath(config.reportDir, await homeDir($), await $.session.cwd())
+  return `${await baseDir($)}/reports`
+}
+
+const rememberReportDir = async ($: EngineInterface, dir: string) => {
+  try {
+    await $.store.set(STORE_LAST_DIR, dir)
+  } catch {
+    // a store that refuses is no reason to lose the report
+  }
+}
+
+const lastReportDir = async ($: EngineInterface): Promise<string | undefined> => {
+  try {
+    const v = await $.store.get(STORE_LAST_DIR)
+    return typeof v === 'string' && v.trim() ? v : undefined
+  } catch {
+    return undefined
+  }
+}
+
+const CANCELLED = Symbol('cancelled')
+
+/**
+ * Resolves the folder a report is written to. `explicit` (a command argument)
+ * wins; else, with `askReportDir` on, a dialog offers the remembered folder,
+ * the default, the project's `reports/` and the Desktop, plus a typed path
+ * under "Other"; a dismissed dialog cancels; where nobody can be asked (a
+ * `-p` run) the default is used.
+ */
+const chooseReportDir = async ($: EngineInterface, explicit: string | undefined): Promise<string | typeof CANCELLED> => {
+  const home = await homeDir($)
+  const cwd = await $.session.cwd()
+  if (explicit) {
+    const dir = expandPath(explicit, home, cwd)
+    await rememberReportDir($, dir)
+    return dir
+  }
+  const fallback = await defaultReportDir($)
+  if (!config.askReportDir) return fallback
+  const last = await lastReportDir($)
+  const candidates: string[] = []
+  const add = (d: string | undefined) => {
+    if (d && !candidates.includes(d)) candidates.push(d)
+  }
+  add(last)
+  add(fallback)
+  add(`${cwd.replace(/\/+$/, '')}/reports`)
+  add(`${home}/Desktop`)
+  const options = candidates.slice(0, 4)
+  const labels = options.map(d => labelPath(d, home))
+  let answer: string
+  try {
+    answer = await $.ui.ask('Where should the report be saved? (pick a folder, or type a path under Other)', { options: labels, header: 'Report dir' })
+  } catch {
+    // dismissed, or nobody to ask: a -p run uses the default, a person who closed the dialog cancels
+    let interactive = true
+    try {
+      interactive = (await $.session.surfaces()).length > 0
+    } catch {
+      interactive = true
+    }
+    return interactive ? CANCELLED : fallback
+  }
+  const picked = labels.indexOf(answer)
+  const dir = picked >= 0 ? (options[picked] ?? fallback) : expandPath(answer, home, cwd)
+  await rememberReportDir($, dir)
+  return dir
+}
+
+// ---------------------------------------------------------------------------
 // Reports: markdown + html always; pdf through a headless browser or cupsfilter
 // ---------------------------------------------------------------------------
 
@@ -323,11 +413,11 @@ const toPdf = async ($: EngineInterface, htmlPath: string, textPath: string, pdf
   return { reason: chrome ? 'the browser did not produce a PDF' : 'no headless browser (Chrome, Chromium, Edge, Brave) and no cupsfilter found; set ACTIVITY_DASHBOARD_CHROME to a browser binary' }
 }
 
-type ReportKind = 'pdf' | 'html' | 'md'
-
-const makeReport = async ($: EngineInterface, kind: ReportKind, target: string): Promise<string> => {
+const makeReport = async ($: EngineInterface, kind: ReportKind, target: string, explicitDir?: string): Promise<string> => {
   const now = await $.clock.now()
   const dir = await baseDir($)
+  const chosen = await chooseReportDir($, explicitDir)
+  if (chosen === CANCELLED) return 'Report cancelled: no folder chosen.'
   let md: string
   let html: string
   let stem: string
@@ -354,7 +444,7 @@ const makeReport = async ($: EngineInterface, kind: ReportKind, target: string):
     stem = `${fmtStamp(rec.startedAt)}_${rec.id.slice(0, 8)}`
     title = `Activity report: ${rec.title}`
   }
-  const reports = `${dir}/reports`
+  const reports = chosen
   const mdPath = `${reports}/${stem}.md`
   const htmlPath = `${reports}/${stem}.html`
   await $.fs.write(mdPath, md)
@@ -457,12 +547,17 @@ const learnSession = async ($: EngineInterface) => {
 // Hooks
 // ---------------------------------------------------------------------------
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  config = {
+    reportDir: typeof options.reportDir === 'string' ? options.reportDir : '',
+    askReportDir: options.askReportDir !== false,
+  }
+
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: COMMAND,
       description: 'Activity dashboard: live model, agents, orchestration, time, tokens, cost; summary and PDF reports',
-      argumentHint: '[summary|sessions|report [pdf|html|md] [all|<id>]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
+      argumentHint: '[summary|sessions|report [pdf|html|md] [all|<id>] [<folder>]|reportdir [<folder>]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
     })
     const now = await $.clock.now()
     const model = await learnSession($)
@@ -497,15 +592,19 @@ export const register: Register = on => {
         return { text: `**Recorded sessions (${recs.length})**\n${lines.join('\n')}\n\n\`/${COMMAND} report pdf <id>\` for one, \`/${COMMAND} report pdf all\` for the whole set.` }
       }
       case 'report': {
-        const kinds: ReportKind[] = ['pdf', 'html', 'md']
-        let kind: ReportKind = 'pdf'
-        let target = ''
-        for (const r of rest) {
-          const low = r.toLowerCase()
-          if ((kinds as string[]).includes(low)) kind = low as ReportKind
-          else target = r
+        const a = parseReportArgs(rest)
+        return { text: await makeReport($, a.kind, a.target, a.dir) }
+      }
+      case 'reportdir': {
+        const wanted = rest.join(' ').trim()
+        const home = await homeDir($)
+        if (wanted) {
+          const dir = expandPath(wanted, home, await $.session.cwd())
+          await rememberReportDir($, dir)
+          return { text: `Reports will be offered in ${dir} first. (The dialog still asks; set askReportDir to false in /config to skip it.)` }
         }
-        return { text: await makeReport($, kind, target) }
+        const last = await lastReportDir($)
+        return { text: `Default report folder: ${await defaultReportDir($)}${last ? `\nLast chosen: ${last}` : ''}\nAsk each time: ${config.askReportDir ? 'yes' : 'no'} (userConfig askReportDir)` }
       }
       case 'title': {
         const title = oneLine(rest.join(' '))

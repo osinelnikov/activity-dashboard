@@ -1,7 +1,25 @@
 {
   "name": "activity-dashboard",
-  "version": "0.1.0",
-  "description": "Live pane: active model, agents and subagents, orchestration tree, context window, token usage, rate limits, cost and tool stats",
-  "author": { "name": "Oleg Sinelnikov" },
-  "types": "./types/index.d.ts"
+  "version": "0.2.0",
+  "description": "Live pane: active model, agents and subagents, orchestration tree, time by phase, context window, token usage, rate limits, cost and tool stats; per-chat records, summaries and PDF reports",
+  "author": {
+    "name": "Oleg Sinelnikov"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "reportDir": {
+      "type": "string",
+      "description": "Default folder for reports (~ allowed). Empty: ~/.claude/activity-dashboard/reports",
+      "default": "",
+      "required": false,
+      "title": "Report folder"
+    },
+    "askReportDir": {
+      "type": "boolean",
+      "description": "Ask which folder a report goes to each time (the last choice is offered first)",
+      "default": true,
+      "required": false,
+      "title": "Ask for the report folder"
+    }
+  }
 }
