@@ -1,4 +1,5 @@
-import type { DashAgent, DashContext, DashEvent, DashMain, DashModelUsage, DashTime, DashTool, DashTurn, DashUsage, SessionRecord } from '../types'
+import type { DashAgent, DashContext, DashEvent, DashFile, DashMain, DashModelUsage, DashSkill, DashTime, DashTool, DashTurn, DashUsage, SessionRecord } from '../types'
+import { changedLines, fmtFilePct, loopLabel, relPath } from './activity'
 import {
   addUsageInto,
   cacheHit,
@@ -31,6 +32,8 @@ export type Snapshot = {
   turns: DashTurn[]
   time: DashTime
   events: DashEvent[]
+  files?: Record<string, DashFile>
+  skills?: DashSkill[]
   now: number
   ended?: boolean
 }
@@ -61,6 +64,8 @@ export const buildRecord = (s: Snapshot): SessionRecord => {
     compactions: s.ctx.compactions,
     maxContextPercent: s.ctx.maxPercent,
     events: s.events,
+    files: Object.values(s.files ?? {}).sort((a, b) => changedLines(b) - changedLines(a)),
+    skills: s.skills ?? [],
   }
 }
 
@@ -114,6 +119,19 @@ const agentTypes = (r: SessionRecord): AgentTypeRow[] => {
 const modelRows = (usage: DashModelUsage): Array<[string, DashUsage]> =>
   Object.entries(usage).sort((a, b) => total(b[1]) - total(a[1]))
 
+const homeOf = (cwd: string): string => {
+  const m = cwd.match(/^(\/Users\/[^/]+|\/home\/[^/]+)/)
+  return m ? m[1]! : ''
+}
+
+const fileRows = (r: SessionRecord): string[][] =>
+  (r.files ?? []).map(f => [relPath(f.path, r.cwd, homeOf(r.cwd)), `+${String(f.added)}`, `−${String(f.removed)}`, fmtFilePct(f), String(f.edits), f.loops.map(l => loopLabel(l, r.agents)).join(', '), f.tools.join(', ')])
+
+const skillRows = (r: SessionRecord): string[][] =>
+  (r.skills ?? []).map(k => [fmtDateTime(k.at).slice(11), k.name, loopLabel(k.loop, r.agents), k.mode, k.plugin ? `plugin ${k.plugin}` : k.source ?? '—', k.ok ? 'ok' : 'failed', cut(k.args ?? '', 50)])
+
+const callerOf = (a: DashAgent, agents: readonly DashAgent[]): string => (a.parentId ? loopLabel(a.parentId, agents) : 'main')
+
 const longestTurn = (r: SessionRecord): DashTurn | undefined =>
   r.turns.reduce<DashTurn | undefined>((best, t) => ((t.ms ?? 0) > (best?.ms ?? -1) ? t : best), undefined)
 
@@ -152,6 +170,20 @@ export const chatSummary = (r: SessionRecord): string => {
     lines.push('')
     lines.push(`**TOOLS** ${r.tools.reduce((n, x) => n + x.calls, 0)} calls`)
     for (const x of r.tools.slice(0, 6)) lines.push(`- ${toolLabel(x.name)}: ${x.calls}${x.errors ? ` (${x.errors} failed)` : ''} · ${fmtMs(x.totalMs)}`)
+  }
+  const files = r.files ?? []
+  if (files.length) {
+    lines.push('')
+    lines.push(`**FILES CHANGED** ${files.length} · +${files.reduce((n, f) => n + f.added, 0)} −${files.reduce((n, f) => n + f.removed, 0)}`)
+    for (const row of fileRows(r).slice(0, 10)) lines.push(`- \`${row[0]}\` ${row[1]} ${row[2]} (${row[3]} of file) · ${row[4]} edits · ${row[5]}`)
+    if (files.length > 10) lines.push(`- … ${files.length - 10} more`)
+  }
+  const skills = r.skills ?? []
+  if (skills.length) {
+    const counts = new Map<string, number>()
+    for (const k of skills) counts.set(k.name, (counts.get(k.name) ?? 0) + 1)
+    lines.push('')
+    lines.push(`**SKILLS** ${[...counts.entries()].map(([n, c]) => `${n} ×${c}`).join(' · ')}`)
   }
   const lt = longestTurn(r)
   if (lt) {
@@ -214,10 +246,23 @@ export const recordToMarkdown = (r: SessionRecord): string => {
     out.push(mdTable(['Type', 'Runs', 'Tokens', 'Time', 'Failed'], agentTypes(r).map(a => [a.type, String(a.count), fmtTok(a.tokens), fmtMs(a.ms), String(a.failed)])))
     out.push('')
     out.push(mdTable(
-      ['#', 'Type', 'Model', 'Status', 'Time', 'Tokens', 'Tools', 'Task'],
-      r.agents.map((a, i) => [String(i + 1), a.parentId ? `↳ ${a.type}` : a.type, shortModel(a.model), a.status, fmtMs((a.endedAt ?? r.updatedAt) - a.startedAt), fmtTok(total(a.usage)), String(a.toolCalls), cut(a.description, 70)]),
+      ['#', 'Type', 'Called by', 'Via', 'Model', 'Status', 'Time', 'Tokens', 'Tools', 'Task'],
+      r.agents.map((a, i) => [String(i + 1), a.parentId ? `↳ ${a.type}` : a.type, callerOf(a, r.agents), a.via ?? '—', shortModel(a.model), a.status, fmtMs((a.endedAt ?? r.updatedAt) - a.startedAt), fmtTok(total(a.usage)), String(a.toolCalls), cut(a.description, 70)]),
     ))
   }
+  out.push('')
+  out.push('## Skills')
+  out.push('')
+  out.push((r.skills ?? []).length ? mdTable(['Time', 'Skill', 'Loaded by', 'Mode', 'Source', 'Result', 'Args'], skillRows(r)) : 'No skills were loaded.')
+  out.push('')
+  out.push('## Files changed')
+  out.push('')
+  out.push(
+    (r.files ?? []).length
+      ? `${(r.files ?? []).length} files · +${(r.files ?? []).reduce((n, f) => n + f.added, 0)} −${(r.files ?? []).reduce((n, f) => n + f.removed, 0)}. "Of file" is changed lines (max of + and −) over the file's lines before its first change.\n\n` +
+          mdTable(['File', '+', '−', 'Of file', 'Edits', 'By', 'Tools'], fileRows(r))
+      : 'No file was changed through Edit, Write, NotebookEdit or a Bash command the engine diffed.',
+  )
   out.push('')
   out.push('## Tools')
   out.push('')
@@ -376,8 +421,17 @@ export const recordToHtml = (r: SessionRecord): string => {
     r.agents.length
       ? htmlTable(['Type', ['Runs', 'num'], ['Tokens', 'num'], ['Time', 'num'], ['Failed', 'num']], agentTypes(r).map(a => [a.type, String(a.count), fmtTok(a.tokens), fmtMs(a.ms), String(a.failed)])) +
         '<h3>Each run</h3>' +
-        htmlTable(['#', 'Type', 'Model', 'Status', ['Time', 'num'], ['Tokens', 'num'], ['Tools', 'num'], 'Task'], r.agents.map((a, i) => [String(i + 1), a.parentId ? `↳ ${a.type}` : a.type, shortModel(a.model), a.status, fmtMs((a.endedAt ?? r.updatedAt) - a.startedAt), fmtTok(total(a.usage)), String(a.toolCalls), cut(a.description, 90)]))
+        htmlTable(['#', 'Type', 'Called by', 'Via', 'Model', 'Status', ['Time', 'num'], ['Tokens', 'num'], ['Tools', 'num'], 'Task'], r.agents.map((a, i) => [String(i + 1), a.parentId ? `↳ ${a.type}` : a.type, callerOf(a, r.agents), a.via ?? '—', shortModel(a.model), a.status, fmtMs((a.endedAt ?? r.updatedAt) - a.startedAt), fmtTok(total(a.usage)), String(a.toolCalls), cut(a.description, 90)]))
       : '<div class="sub">No subagents were spawned.</div>',
+    '<h2>Skills</h2>',
+    (r.skills ?? []).length
+      ? htmlTable(['Time', 'Skill', 'Loaded by', 'Mode', 'Source', 'Result', 'Args'], skillRows(r))
+      : '<div class="sub">No skills were loaded.</div>',
+    '<h2>Files changed</h2>',
+    (r.files ?? []).length
+      ? `<div class="sub">${(r.files ?? []).length} files · +${(r.files ?? []).reduce((n, f) => n + f.added, 0)} −${(r.files ?? []).reduce((n, f) => n + f.removed, 0)} · “of file” is changed lines (max of + and −) over the file’s lines before its first change</div>` +
+        htmlTable(['File', ['+', 'num'], ['−', 'num'], ['Of file', 'num'], ['Edits', 'num'], 'By', 'Tools'], fileRows(r))
+      : '<div class="sub">No file was changed through Edit, Write, NotebookEdit or a diffed Bash command.</div>',
     '<h2>Tools</h2>',
     r.tools.length
       ? `<div class="bars">${r.tools.slice(0, 8).map(x => bar(toolLabel(x.name), x.calls / Math.max(1, r.tools[0]?.calls ?? 1), `${x.calls} calls · ${fmtMs(x.totalMs)}${x.errors ? ` · ${x.errors} failed` : ''}`, x.errors ? 'var(--bar3)' : 'var(--bar2)')).join('')}</div>` +

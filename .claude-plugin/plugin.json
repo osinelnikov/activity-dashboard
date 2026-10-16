@@ -1,7 +1,7 @@
 {
   "name": "activity-dashboard",
-  "version": "0.2.0",
-  "description": "Live pane: active model, agents and subagents, orchestration tree, time by phase, context window, token usage, rate limits, cost and tool stats; per-chat records, summaries and PDF reports",
+  "version": "0.3.0",
+  "description": "Live pane: what every loop is doing now, the agent tree with who called whom, skills loaded, files changed with +/- and share, time by phase, context, tokens, rate limits, cost and tools; per-chat records, summaries and reports",
   "author": {
     "name": "Oleg Sinelnikov"
   },

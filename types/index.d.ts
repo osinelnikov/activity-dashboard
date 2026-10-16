@@ -48,6 +48,55 @@ export type DashAgent = {
   usage: DashUsage
   steps: number
   toolCalls: number
+  /** How it was started: `Agent tool`, `workflow`, `fork`, `teammate`, `skill:<name>`, `untracked`. */
+  via?: string
+}
+
+/** What one loop (`main` or an agent id) is doing right now. */
+export type DashNowKind = 'starting' | 'thinking' | 'answering' | 'preparing' | 'tool' | 'idle'
+
+export type DashNow = {
+  what: DashNowKind
+  /** The tool and its argument summary, or the tool being composed. */
+  detail: string
+  since: number
+  /** The skill this loop loaded in its current turn. */
+  skill?: string
+}
+
+/** One skill load: through the Skill tool, a `/command` or a preload. */
+export type DashSkill = {
+  at: number
+  name: string
+  /** `main` or the agent id whose loop loaded it. */
+  loop: string
+  mode: 'inline' | 'forked' | 'command'
+  args?: string
+  /** The forked skill's own agent. */
+  agentId?: string
+  source?: string
+  plugin?: string
+  ok: boolean
+  ms?: number
+}
+
+/** One file this session changed, its edits summed. */
+export type DashFile = {
+  path: string
+  added: number
+  removed: number
+  edits: number
+  /** Lines before the session's first change; absent when not known. */
+  baseLines?: number
+  /** Lines after the latest change; absent when not known. */
+  lines?: number
+  created: boolean
+  deleted: boolean
+  tools: string[]
+  /** `main` or the agent ids that changed it. */
+  loops: string[]
+  firstAt: number
+  lastAt: number
 }
 
 export type DashRateLimit = { kind: string; percentUsed: number; resetsAt?: string }
@@ -102,6 +151,8 @@ export type DashView = {
   showSteps: boolean
   showModels: boolean
   showTime: boolean
+  showFiles?: boolean
+  showSkills?: boolean
   chart: DashChartMode
   /** The person's theme is dark: picks the dark palette steps. */
   dark: boolean
@@ -161,6 +212,9 @@ export type SessionRecord = {
   compactions: number
   maxContextPercent?: number
   events: DashEvent[]
+  /** Absent in records written before 0.3.0. */
+  files?: DashFile[]
+  skills?: DashSkill[]
 }
 
 declare module 'claude-code' {
@@ -177,6 +231,9 @@ declare module 'claude-code' {
       view: DashView
       turns: DashTurn[]
       time: DashTime
+      files: Record<string, DashFile>
+      skills: DashSkill[]
+      now: Record<string, DashNow>
     }
   }
 }

@@ -6,8 +6,11 @@ import type {
   DashAgent,
   DashContext,
   DashEvent,
+  DashFile,
   DashMain,
   DashModelUsage,
+  DashNow,
+  DashSkill,
   DashStep,
   DashTime,
   DashTool,
@@ -44,6 +47,7 @@ import {
   total,
   untilIso,
 } from './format'
+import { MAIN, agentLabel, changedLines, describeNow, extractChanges, fmtFilePct, lineCount, loopLabel, mergeFile, relPath, sinceText, skillBadge } from './activity'
 import { meterRow, nextChartMode, paletteOf, shareChart, textBar } from './charts'
 import type { ChartOptions, ChartTable, Slice } from './charts'
 import { expandPath, labelPath, parseReportArgs } from './paths'
@@ -96,6 +100,12 @@ const stepsAtom = atom({ plugin: 'activity-dashboard', key: 'steps' } as const, 
 const eventsAtom = atom({ plugin: 'activity-dashboard', key: 'events' } as const, [] as DashEvent[])
 const turnsAtom = atom({ plugin: 'activity-dashboard', key: 'turns' } as const, [] as DashTurn[])
 const timeAtom = atom({ plugin: 'activity-dashboard', key: 'time' } as const, emptyTime())
+const filesAtom = atom({ plugin: 'activity-dashboard', key: 'files' } as const, {} as Record<string, DashFile>)
+const skillsAtom = atom({ plugin: 'activity-dashboard', key: 'skills' } as const, [] as DashSkill[])
+const nowAtom = atom({ plugin: 'activity-dashboard', key: 'now' } as const, {} as Record<string, DashNow>)
+
+const MAX_SKILLS = 200
+const MAX_FILES = 400
 const viewAtom = atom({ plugin: 'activity-dashboard', key: 'view' } as const, {
   showTools: true,
   showLog: true,
@@ -164,6 +174,9 @@ const clearStats = async ($: EngineInterface, keepSession: boolean) => {
   await update($, eventsAtom, () => [])
   await update($, turnsAtom, () => [])
   await update($, timeAtom, () => emptyTime())
+  await update($, filesAtom, () => ({}))
+  await update($, skillsAtom, () => [])
+  await update($, nowAtom, () => ({}))
   await update($, contextAtom, c => (keepSession ? { ...c, compactions: 0, lastCompaction: undefined, maxPercent: c.percent } : emptyContext()))
 }
 
@@ -174,8 +187,11 @@ const resetAll = async ($: EngineInterface) => {
   await pushEvent($, now, 'statistics reset', 'info')
 }
 
-const toggleView = async ($: EngineInterface, key: keyof DashView) => {
-  await update($, viewAtom, v => ({ ...v, [key]: !v[key] }))
+type ViewFlag = 'showTools' | 'showLog' | 'showSteps' | 'showModels' | 'showTime' | 'showFiles' | 'showSkills'
+
+/** Flips a section's flag; a flag never set reads as shown. */
+const toggleView = async ($: EngineInterface, key: ViewFlag) => {
+  await update($, viewAtom, v => ({ ...v, [key]: !(v[key] ?? true) }))
 }
 
 const bumpTurn = async ($: EngineInterface, change: (t: DashTurn) => DashTurn) => {
@@ -220,6 +236,117 @@ const noteStepUsage = async (
 }
 
 // ---------------------------------------------------------------------------
+// Loops: what each is doing, the agents nobody announced, skills, file changes
+// ---------------------------------------------------------------------------
+
+/** Sets what a loop is doing; keeps the loop's skill unless the patch names one. */
+const setNow = async ($: EngineInterface, loop: string, patch: Omit<DashNow, 'skill'> & { skill?: string | null }) => {
+  await update($, nowAtom, map => {
+    const prev = map[loop]
+    const skill = patch.skill === null ? undefined : (patch.skill ?? prev?.skill)
+    return { ...map, [loop]: { what: patch.what, detail: patch.detail, since: patch.since, skill } }
+  })
+}
+
+const dropNow = async ($: EngineInterface, loop: string) => {
+  await update($, nowAtom, map => {
+    if (!(loop in map)) return map
+    const { [loop]: _gone, ...rest } = map
+    return rest
+  })
+}
+
+/** Agent ids already looked up in `$.agent.list()`, and when: an unknown id is asked again after 5s. */
+const lookedUp = new Map<string, number>()
+
+/**
+ * Adds an agent the session runs that no `agent.spawn` announced (a forked
+ * skill, a loop the engine tracks on its own), from `$.agent.list()`. With
+ * `placeholder`, one the list does not know is added too, as `agent`.
+ */
+const ensureAgent = async ($: EngineInterface, id: string, placeholder: boolean, via?: string) => {
+  const agents = await read($, agentsAtom)
+  if (agents.some(a => a.id === id)) return
+  const at = await $.clock.now()
+  const last = lookedUp.get(id)
+  if (!placeholder && last !== undefined && at - last < 5000) return
+  lookedUp.set(id, at)
+  let info: Awaited<ReturnType<EngineInterface['agent']['list']>>[number] | undefined
+  try {
+    info = (await $.agent.list()).find(a => a.id === id)
+  } catch {
+    info = undefined
+  }
+  if (!info && !placeholder) return
+  const agent: DashAgent = {
+    id,
+    type: info?.type ?? 'agent',
+    description: cut(oneLine(info?.description ?? ''), 80),
+    model: '',
+    parentId: info?.parentId,
+    name: info?.name,
+    status: info?.status ?? 'running',
+    background: false,
+    startedAt: at,
+    usage: emptyUsage(),
+    steps: 0,
+    toolCalls: 0,
+    via: via ?? 'untracked',
+  }
+  await update($, agentsAtom, list => (list.some(a => a.id === id) ? list : [...list, agent].slice(-MAX_AGENTS)))
+}
+
+/** Skill tool calls in flight, by skill name: `skill.prompt` adds its source to them. */
+const pendingSkills = new Map<string, number>()
+const pendingSource = new Map<string, { source: string; plugin?: string }>()
+
+const pushSkill = async ($: EngineInterface, s: DashSkill) => {
+  await update($, skillsAtom, list => [...list, s].slice(-MAX_SKILLS))
+}
+
+const noteFileChanges = async ($: EngineInterface, tool: string, input: Record<string, unknown>, result: unknown, loop: string) => {
+  const changes = extractChanges(tool, input, result)
+  if (!changes.length) return
+  const at = await $.clock.now()
+  const unknownSize: string[] = []
+  await update($, filesAtom, map => {
+    const next = { ...map }
+    for (const ch of changes) {
+      const f = mergeFile(next[ch.path], ch, loop, tool, at)
+      next[ch.path] = f
+      if (f.lines === undefined && !f.deleted) unknownSize.push(ch.path)
+    }
+    const keys = Object.keys(next)
+    if (keys.length > MAX_FILES) {
+      for (const k of keys.sort((a, b) => (next[a]?.lastAt ?? 0) - (next[b]?.lastAt ?? 0)).slice(0, keys.length - MAX_FILES)) delete next[k]
+    }
+    return next
+  })
+  // a Bash change says nothing of the file's size: read it once to size the share
+  for (const path of unknownSize.slice(0, 20)) {
+    let lines: number | undefined
+    try {
+      lines = lineCount(await $.fs.read(path))
+    } catch {
+      lines = undefined
+    }
+    if (lines === undefined) continue
+    const n = lines
+    await update($, filesAtom, map => {
+      const f = map[path]
+      if (!f || f.lines !== undefined) return map
+      return { ...map, [path]: { ...f, lines: n, baseLines: f.baseLines ?? Math.max(0, n - f.added + f.removed) } }
+    })
+  }
+  const label = loop === MAIN ? 'main' : loopLabel(loop, await read($, agentsAtom))
+  const sum = changes.reduce((acc, c) => ({ added: acc.added + c.added, removed: acc.removed + c.removed }), { added: 0, removed: 0 })
+  const cwd = (await read($, mainAtom)).cwd
+  const home = (await $.env.get('HOME').catch(() => undefined)) ?? ''
+  const what = changes.length === 1 ? relPath(changes[0]!.path, cwd, home) : `${String(changes.length)} files`
+  await pushEvent($, at, `✎ ${label}: ${cut(what, 48)} +${String(sum.added)} −${String(sum.removed)}`, 'info')
+}
+
+// ---------------------------------------------------------------------------
 // Persistence: one JSON per chat under <home>/.claude/activity-dashboard
 // ---------------------------------------------------------------------------
 
@@ -235,7 +362,7 @@ const baseDir = async ($: EngineInterface): Promise<string> => {
 }
 
 const snapshot = async ($: EngineInterface, ended = false): Promise<Snapshot> => {
-  const [main, usage, agents, ctx, tools, turns, time, events, now] = await Promise.all([
+  const [main, usage, agents, ctx, tools, turns, time, events, files, skills, now] = await Promise.all([
     read($, mainAtom),
     read($, usageAtom),
     read($, agentsAtom),
@@ -244,9 +371,11 @@ const snapshot = async ($: EngineInterface, ended = false): Promise<Snapshot> =>
     read($, turnsAtom),
     read($, timeAtom),
     read($, eventsAtom),
+    read($, filesAtom),
+    read($, skillsAtom),
     $.clock.now(),
   ])
-  return { main, usage, agents, ctx, tools, turns, time, events, now, ended }
+  return { main, usage, agents, ctx, tools, turns, time, events, files, skills, now, ended }
 }
 
 const persist = async ($: EngineInterface, ended = false): Promise<SessionRecord | undefined> => {
@@ -588,7 +717,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: COMMAND,
       description: 'Activity dashboard: live model, agents, orchestration, time, tokens, cost; summary and PDF reports',
-      argumentHint: '[summary|sessions|report [md|pdf|html] [all|<id>] [<folder>]|reportdir [<folder>]|chart [bars|stacked|donut]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
+      argumentHint: '[summary|sessions|report [md|pdf|html] [all|<id>] [<folder>]|reportdir [<folder>]|chart [bars|stacked|donut]|title <text>|reset|close|breakdown|files|skills|tools|log|steps|models|time]',
     })
     const now = await $.clock.now()
     const model = await learnSession($)
@@ -680,6 +809,12 @@ export const register: Register = (on, options) => {
       case 'time':
         await toggleView($, 'showTime')
         return { text: 'Activity dashboard: time section toggled.' }
+      case 'files':
+        await toggleView($, 'showFiles')
+        return { text: 'Activity dashboard: files section toggled.' }
+      case 'skills':
+        await toggleView($, 'showSkills')
+        return { text: 'Activity dashboard: skills section toggled.' }
       case 'chart': {
         const wanted = (rest[0] ?? '').toLowerCase()
         const pick = wanted === 'bars' || wanted === 'stacked' || wanted === 'donut' ? wanted : undefined
@@ -721,6 +856,7 @@ export const register: Register = (on, options) => {
     await update($, turnsAtom, list =>
       [...list, { index: list.length + 1, turnId: e.turnId, startedAt: now, prompt: cut(head, 200), toolCalls: 0, agents: 0, modelMs: 0, toolMs: 0 }].slice(-MAX_TURNS),
     )
+    await setNow($, MAIN, { what: 'thinking', detail: '', since: now, skill: null })
     await pushEvent($, now, head ? `turn: ${cut(head, 60)}` : 'turn started (continuation)', 'info')
     return next(e)
   })
@@ -742,7 +878,40 @@ export const register: Register = (on, options) => {
         messageCount: e.messageCount,
       }))
     }
-    const r = yield* next(e)
+    const loop = e.agentId ?? MAIN
+    if (e.agentId) await ensureAgent($, e.agentId, false)
+    // the engine's own forks (compaction, memory) step too: mark only loops the dashboard shows
+    const tracked = !e.agentId || (await read($, agentsAtom)).some(a => a.id === e.agentId)
+    if (tracked) await setNow($, loop, { what: 'thinking', detail: '', since: started })
+    // pass every chunk on unchanged and return what beneath returned (read off
+    // the iterator itself, as yield* does); note only when the kind of work changes
+    const it = next(e)[Symbol.asyncIterator]()
+    let lastKind = 'thinking'
+    let finished = false
+    let step = await it.next()
+    try {
+      while (!step.done) {
+        const chunk = step.value
+        yield chunk
+        const kind = chunk.kind === 'text' ? 'answering' : chunk.kind === 'thinking' ? 'thinking' : chunk.kind === 'tool' ? `tool:${chunk.name}` : undefined
+        if (tracked && kind !== undefined && kind !== lastKind) {
+          lastKind = kind
+          try {
+            const at = await $.clock.now()
+            if (chunk.kind === 'tool') await setNow($, loop, { what: 'preparing', detail: chunk.name, since: at })
+            else await setNow($, loop, { what: kind === 'answering' ? 'answering' : 'thinking', detail: '', since: at })
+          } catch {
+            // bookkeeping never stands in the stream's way
+          }
+        }
+        step = await it.next()
+      }
+      finished = true
+    } finally {
+      // read no further (an interrupt, a consumer that stopped): close what is beneath
+      if (!finished) await it.return(undefined as never)
+    }
+    const r = step.value
     const now = await $.clock.now()
     const ms = now - started
     if (!e.agentId) {
@@ -776,6 +945,7 @@ export const register: Register = (on, options) => {
         }),
       )
       if (agentMsDelta > 0) await update($, timeAtom, t => ({ ...t, agentMs: t.agentMs + agentMsDelta }))
+      await dropNow($, id)
       if (known) {
         const k = known
         await pushEvent(
@@ -801,6 +971,7 @@ export const register: Register = (on, options) => {
         }
       })
       await bumpTurn($, t => ({ ...t, endedAt: now, ms: Math.max(e.durationMs, now - t.startedAt), usage: u, costDelta, reason: e.reason }))
+      await setNow($, MAIN, { what: 'idle', detail: '', since: now })
       await update($, timeAtom, t => ({ ...t, idleSince: now }))
       await pushEvent(
         $,
@@ -832,10 +1003,13 @@ export const register: Register = (on, options) => {
         usage: emptyUsage(),
         steps: 0,
         toolCalls: 0,
+        via: e.workflow ? 'workflow' : e.isTeammate ? 'teammate' : e.fork ? 'fork' : 'Agent tool',
       }
       await update($, agentsAtom, list => [...list.filter(a => a.id !== agent.id), agent].slice(-MAX_AGENTS))
+      await setNow($, agent.id, { what: 'starting', detail: '', since: now })
       if (!e.parentAgentId) await bumpTurn($, t => ({ ...t, agents: t.agents + 1 }))
-      await pushEvent($, now, `▶ agent ${agent.type} (${shortModel(agent.model)}): ${cut(agent.description, 50)}`, 'info')
+      const parent = e.parentAgentId ? loopLabel(e.parentAgentId, await read($, agentsAtom)) : 'main'
+      await pushEvent($, now, `▶ ${parent} → ${agent.type} (${shortModel(agent.model)}): ${cut(agent.description, 44)}`, 'info')
     }
     return r
   })
@@ -847,21 +1021,63 @@ export const register: Register = (on, options) => {
     const tool = String(e.tool)
     const id = e.tool_use_id
     const agentId = e.agentId
-    const detail = detailOf(e as unknown as Record<string, unknown>)
+    const input = e as unknown as Record<string, unknown>
+    const detail = detailOf(input)
+    const loop = agentId ?? MAIN
+    if (agentId) await ensureAgent($, agentId, true)
     await update($, activeAtom, list => [...list, { id, tool, agentId, startedAt: started, detail }].slice(-MAX_ACTIVE))
+    await setNow($, loop, { what: 'tool', detail: `${toolLabel(tool)}${detail ? `: ${detail}` : ''}`, since: started })
     if (!agentId) await update($, mainAtom, m => ({ ...m, phase: 'tool' as const }))
+    const skillName = tool === 'Skill' && typeof input.skill === 'string' ? input.skill : undefined
+    if (skillName) pendingSkills.set(skillName, started)
     let isError = false
     try {
       const r = await next(e)
       isError = r.deny !== undefined || r.isError === true
+      if (!isError) {
+        try {
+          await noteFileChanges($, tool, input, r.result, loop)
+        } catch {
+          // a result of an unexpected shape counts no lines
+        }
+      }
+      if (skillName) {
+        const res = (r.result ?? {}) as Record<string, unknown>
+        const forked = res.status === 'forked' && typeof res.agentId === 'string' ? res.agentId : undefined
+        const at = await $.clock.now()
+        const source = pendingSource.get(skillName)
+        pendingSource.delete(skillName)
+        await pushSkill($, {
+          at: started,
+          name: typeof res.commandName === 'string' && res.commandName ? res.commandName : skillName,
+          loop,
+          mode: forked ? 'forked' : 'inline',
+          args: typeof input.args === 'string' && input.args ? cut(oneLine(input.args), 120) : undefined,
+          agentId: forked,
+          source: source?.source,
+          plugin: source?.plugin,
+          ok: !isError && res.success !== false,
+          ms: at - started,
+        })
+        if (forked) {
+          await ensureAgent($, forked, true, `skill:${skillName}`)
+          await update($, agentsAtom, list => list.map(a => (a.id === forked ? { ...a, via: `skill:${skillName}`, parentId: a.parentId ?? agentId, type: a.type === 'agent' ? `skill:${skillName}` : a.type } : a)))
+        } else if (!isError) {
+          await setNow($, loop, { what: 'thinking', detail: '', since: at, skill: skillName })
+        }
+        await pushEvent($, at, `★ ${loop === MAIN ? 'main' : loopLabel(loop, await read($, agentsAtom))} loaded skill ${skillName}${forked ? ' (forked)' : ''}`, isError ? 'error' : 'info')
+      }
       return r
     } catch (err) {
       isError = true
       throw err
     } finally {
+      if (skillName) pendingSkills.delete(skillName)
       const now = await $.clock.now()
       const ms = now - started
       await update($, activeAtom, list => list.filter(a => a.id !== id))
+      const stillRunning = (await read($, activeAtom)).some(a => (a.agentId ?? MAIN) === loop)
+      if (!stillRunning) await setNow($, loop, { what: 'thinking', detail: '', since: now })
       await update($, toolsAtom, map => {
         const t = map[tool] ?? { name: tool, calls: 0, errors: 0, totalMs: 0 }
         return { ...map, [tool]: { ...t, calls: t.calls + 1, errors: t.errors + (isError ? 1 : 0), totalMs: t.totalMs + ms } }
@@ -876,6 +1092,26 @@ export const register: Register = (on, options) => {
       }
       if (isError) await pushEvent($, now, `✗ ${toolLabel(tool)} failed${detail ? `: ${cut(detail, 40)}` : ''}`, 'error')
     }
+  })
+
+  // --- skills ------------------------------------------------------------------
+
+  on('skill.prompt', async ($, e, next) => {
+    const r = await next(e)
+    try {
+      const info = { source: String(e.source), plugin: e.pluginName }
+      if (pendingSkills.has(e.skill)) {
+        pendingSource.set(e.skill, info)
+      } else {
+        const at = await $.clock.now()
+        await pushSkill($, { at, name: e.skill, loop: MAIN, mode: 'command', source: info.source, plugin: info.plugin, ok: true })
+        await setNow($, MAIN, { what: 'thinking', detail: '', since: at, skill: e.skill })
+        await pushEvent($, at, `★ skill ${e.skill} loaded (${info.plugin ? `plugin ${info.plugin}` : info.source})`, 'info')
+      }
+    } catch {
+      // the skill's text goes through whatever the bookkeeping does
+    }
+    return r
   })
 
   // --- context, cost, rate limits -----------------------------------------
@@ -940,7 +1176,7 @@ export const register: Register = (on, options) => {
     const { Box, Text, Button } = $.ui.resolve(e)
     const t: ChartTable = e.surface === 'terminal' ? { Box, Text } : { Box, Text, Svg: $.ui.resolve(e).Svg }
     const now = await $.clock.now()
-    const [main, usage, agents, ctx, tools, active, steps, events, view, turns, time] = await Promise.all([
+    const [main, usage, agents, ctx, tools, active, steps, events, view, turns, time, files, skills, nowMap] = await Promise.all([
       read($, mainAtom),
       read($, usageAtom),
       read($, agentsAtom),
@@ -952,7 +1188,18 @@ export const register: Register = (on, options) => {
       read($, viewAtom),
       read($, turnsAtom),
       read($, timeAtom),
+      read($, filesAtom),
+      read($, skillsAtom),
+      read($, nowAtom),
     ])
+    let home = ''
+    try {
+      home = (await $.env.get('HOME')) ?? ''
+    } catch {
+      home = ''
+    }
+    const isLive = (a: DashAgent) => !isDoneStatus(a.status) && a.endedAt === undefined
+    const filesOf = (loop: string) => Object.values(files).filter(f => f.loops.includes(loop))
 
     const W = clamp(e.props.bodyColumns ?? e.viewport?.columns ?? 80, 36, 160)
     const inner = W - 4
@@ -1054,6 +1301,56 @@ export const register: Register = (on, options) => {
       )
     }
     section('ACTIVITY', `chart: ${mode}`, headerRows)
+
+    // ---- 1b. now: one row per live loop ------------------------------------
+    {
+      const live = agents.filter(isLive)
+      const loops = [MAIN, ...live.map(a => a.id)]
+      const nowRows = loops.map(loop => {
+        const a = loop === MAIN ? undefined : agents.find(x => x.id === loop)
+        const d = describeNow(loop, nowMap[loop], active, agents, now, isLive)
+        const isIdle = loop === MAIN && main.phase === 'idle' && !active.some(x => !x.agentId)
+        const sg = statusGlyph(a?.status ?? 'running')
+        const glyph = loop === MAIN ? phase : { glyph: sg.glyph, color: sg.color }
+        let depth = 0
+        let p = a?.parentId
+        while (p && depth < 6) {
+          depth += 1
+          p = agents.find(x => x.id === p)?.parentId
+        }
+        const who = loop === MAIN ? 'main' : `${'  '.repeat(depth)}↳ ${agentLabel(a)}`
+        const skill = nowMap[loop]?.skill
+        const since = isIdle ? (time.idleSince !== undefined ? sinceText(time.idleSince, now) : '') : sinceText(d.since, now)
+        const text = isIdle ? 'idle · waiting for you' : d.text
+        return (
+          <Box flexDirection="row" gap={1}>
+            <Box width={1}>
+              <Text color={glyph.color}>{glyph.glyph}</Text>
+            </Box>
+            <Box width={20}>
+              <Text bold={loop === MAIN} wrap="truncate-end">
+                {cut(who, 20)}
+              </Text>
+            </Box>
+            <Box width={9}>
+              <Text dimColor wrap="truncate-end">
+                {cut(shortModel(loop === MAIN ? main.model || main.sessionModel : a?.model), 9)}
+              </Text>
+            </Box>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text wrap="truncate-end">
+                {skill ? <Text color="planMode">{`★ ${cut(skill, 24)} · `}</Text> : ''}
+                <Text color={isIdle ? 'subtle' : 'text'}>{text}</Text>
+              </Text>
+            </Box>
+            <Box width={7} justifyContent="flex-end">
+              <Text dimColor>{since}</Text>
+            </Box>
+          </Box>
+        )
+      })
+      section('NOW', `${String(loops.length)} loop${loops.length === 1 ? '' : 's'} · ${fmtClock(now)}`, nowRows)
+    }
 
     // ---- 2. time ----------------------------------------------------------
     if (view.showTime) {
@@ -1178,6 +1475,8 @@ export const register: Register = (on, options) => {
             {'  '}
             {shortModel(main.model || main.sessionModel)}
             {main.effort ? ` · ${main.effort}` : ''}
+            {nowMap[MAIN]?.skill ? ` · ${skillBadge(nowMap[MAIN]?.skill)}` : ''}
+            {filesOf(MAIN).length ? ` · ${String(filesOf(MAIN).length)} files` : ''}
             {mainActive.length ? ` · ${mainActive.map(a => toolLabel(a.tool)).join(', ')}` : ''}
           </Text>
         </Text>,
@@ -1199,11 +1498,25 @@ export const register: Register = (on, options) => {
               <Text dimColor>
                 {'  '}
                 {shortModel(a.model)} · {elapsed} · {fmtTok(total(a.usage))} tok · {String(a.toolCalls)} tools
+                {filesOf(a.id).length ? ` · ${String(filesOf(a.id).length)} files` : ''}
+                {a.via && a.via !== 'Agent tool' ? ` · via ${a.via}` : ''}
                 {a.background ? ' · bg' : ''}
-                {running.length ? ` · ${running.map(x => toolLabel(x.tool)).join(', ')}` : ''}
               </Text>
             </Text>,
           )
+          if (isLive(a)) {
+            const d = describeNow(a.id, nowMap[a.id], running.length ? running : active, agents, now, isLive)
+            const sk = nowMap[a.id]?.skill
+            rows.push(
+              <Text wrap="truncate-end">
+                <Text dimColor>{`${prefix}${last ? '   ' : '│  '}  `}</Text>
+                <Text color="claude">now </Text>
+                {sk ? <Text color="planMode">{`★ ${cut(sk, 20)} · `}</Text> : ''}
+                <Text>{cut(d.text, Math.max(10, inner - prefix.length - 16))}</Text>
+                <Text dimColor>{d.since !== undefined ? ` · ${sinceText(d.since, now)}` : ''}</Text>
+              </Text>,
+            )
+          }
           if (a.description) {
             rows.push(
               <Text wrap="truncate-end" dimColor>
@@ -1239,6 +1552,107 @@ export const register: Register = (on, options) => {
         )
       } else rows.push(dimLine('no subagents spawned yet'))
       section('ORCHESTRATION', agents.length ? `${String(agents.filter(a => !isDoneStatus(a.status)).length)} live / ${String(agents.length)}` : undefined, rows)
+    }
+
+    // ---- 5b. skills ---------------------------------------------------------
+    if (view.showSkills !== false && skills.length) {
+      const counts = new Map<string, number>()
+      for (const sk of skills) counts.set(sk.name, (counts.get(sk.name) ?? 0) + 1)
+      const rowsSk: RenderNode[] = skills.slice(-8).map(sk => (
+        <Box flexDirection="row" gap={1}>
+          <Box width={8}>
+            <Text dimColor>{fmtClock(sk.at)}</Text>
+          </Box>
+          <Box width={1}>
+            <Text color={sk.ok ? 'planMode' : 'error'}>{sk.ok ? '★' : '✗'}</Text>
+          </Box>
+          <Box width={24}>
+            <Text bold wrap="truncate-end">
+              {cut(sk.name, 24)}
+            </Text>
+          </Box>
+          <Box width={16}>
+            <Text dimColor wrap="truncate-end">
+              {cut(loopLabel(sk.loop, agents), 16)}
+            </Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1}>
+            <Text dimColor wrap="truncate-end">
+              {`${sk.mode}${sk.plugin ? ` · plugin ${sk.plugin}` : sk.source ? ` · ${sk.source}` : ''}${sk.ms !== undefined ? ` · ${fmtMs(sk.ms)}` : ''}${sk.args ? ` · ${sk.args}` : ''}`}
+            </Text>
+          </Box>
+        </Box>
+      ))
+      rowsSk.push(dimLine([...counts.entries()].sort((a, b) => b[1] - a[1]).map(([n, c]) => `${n} ×${String(c)}`).join(' · ')))
+      section('SKILLS', `${String(skills.length)} loads · ${String(counts.size)} skills`, rowsSk)
+    }
+
+    // ---- 5c. files changed -------------------------------------------------
+    if (view.showFiles !== false && Object.keys(files).length) {
+      const list = Object.values(files).sort((a, b) => b.lastAt - a.lastAt)
+      const totalAdd = list.reduce((n, f) => n + f.added, 0)
+      const totalDel = list.reduce((n, f) => n + f.removed, 0)
+      const pathW = clamp(inner - 48, 14, 60)
+      const mini = 8
+      const rowsF: RenderNode[] = [
+        <Box flexDirection="row" gap={1}>
+          <Box width={pathW}>
+            <Text dimColor>file</Text>
+          </Box>
+          <Box width={6} justifyContent="flex-end">
+            <Text dimColor>+</Text>
+          </Box>
+          <Box width={6} justifyContent="flex-end">
+            <Text dimColor>−</Text>
+          </Box>
+          <Box width={mini}>
+            <Text dimColor>diff</Text>
+          </Box>
+          <Box width={7} justifyContent="flex-end">
+            <Text dimColor>of file</Text>
+          </Box>
+          <Box flexGrow={1}>
+            <Text dimColor>edits · by</Text>
+          </Box>
+        </Box>,
+        ...list.slice(0, 12).map(f => {
+          const tot = Math.max(1, f.added + f.removed)
+          const plus = f.added ? clamp(Math.round((f.added / tot) * mini), 1, mini) : 0
+          const minus = f.removed ? clamp(mini - plus, 1, mini) : 0
+          const by = f.loops.map(l => loopLabel(l, agents)).join(', ')
+          return (
+            <Box flexDirection="row" gap={1}>
+              <Box width={pathW}>
+                <Text wrap="truncate-start">{relPath(f.path, main.cwd, home)}</Text>
+              </Box>
+              <Box width={6} justifyContent="flex-end">
+                <Text color="success">{`+${String(f.added)}`}</Text>
+              </Box>
+              <Box width={6} justifyContent="flex-end">
+                <Text color="error">{`−${String(f.removed)}`}</Text>
+              </Box>
+              <Box width={mini}>
+                <Text>
+                  <Text color="success">{'■'.repeat(plus)}</Text>
+                  <Text color="error">{'■'.repeat(Math.min(minus, mini - plus))}</Text>
+                  <Text dimColor>{'·'.repeat(Math.max(0, mini - plus - minus))}</Text>
+                </Text>
+              </Box>
+              <Box width={7} justifyContent="flex-end">
+                <Text dimColor>{fmtFilePct(f)}</Text>
+              </Box>
+              <Box flexGrow={1} flexShrink={1}>
+                <Text dimColor wrap="truncate-end">
+                  {`${String(f.edits)}× · ${by} · ${fmtClock(f.lastAt)}`}
+                </Text>
+              </Box>
+            </Box>
+          )
+        }),
+      ]
+      if (list.length > 12) rowsF.push(dimLine(`+${String(list.length - 12)} more files`))
+      rowsF.push(dimLine('of file: changed lines, max of + and −, over the file lines before the first change'))
+      section('FILES CHANGED', `${String(list.length)} files · +${String(totalAdd)} −${String(totalDel)}`, rowsF)
     }
 
     // ---- 6. active tool calls -------------------------------------------
@@ -1381,6 +1795,12 @@ export const register: Register = (on, options) => {
           </Button>
           <Button key="time" hotkey="i" plain dimColor={!view.showTime} onPress={() => void toggleView($, 'showTime')}>
             i:time
+          </Button>
+          <Button key="files" hotkey="f" plain dimColor={view.showFiles === false} onPress={() => void toggleView($, 'showFiles')}>
+            f:files
+          </Button>
+          <Button key="skills" hotkey="k" plain dimColor={view.showSkills === false} onPress={() => void toggleView($, 'showSkills')}>
+            k:skills
           </Button>
           <Button key="models" hotkey="m" plain dimColor={!view.showModels} onPress={() => void toggleView($, 'showModels')}>
             m:models

@@ -50,10 +50,12 @@ with the keyboard focus. Arguments:
 | `close`                           | closes the pane                                                        |
 | `breakdown`                       | refreshes the context-window breakdown                                 |
 | `chart [bars\|stacked\|donut]`    | how share charts are drawn; no argument cycles the three         |
+| `files`, `skills`                 | show or hide the files-changed and skills sections               |
 | `time`, `models`, `tools`, `steps`, `log` | show or hide a section                                       |
 
 While the pane has the keyboard (ctrl+x tab, or a click), the hotkeys `c`
-(chart mode), `p` (PDF report), `b`, `i`, `m`, `t`, `s`, `l` and `r` do the same.
+(chart mode), `p` (PDF report), `f` (files), `k` (skills), `b`, `i`, `m`, `t`, `s`, `l`
+and `r` do the same.
 
 ## How it looks
 
@@ -110,6 +112,21 @@ is written in the PDF's place and can be printed to PDF from any browser.
 
 ## Sections of the pane
 
+- **NOW** — one row per live loop: `main` and every running agent, indented under
+  the one that started it. Each row says which model it runs on, the skill it
+  loaded in its current turn, what it is doing this second — thinking, writing
+  the answer, preparing a call to a tool, running a tool with a summary of its
+  arguments, or waiting for the agents it started — and for how long.
+- **SKILLS** — every skill load: when, which skill, which loop loaded it, how
+  (`inline` through the Skill tool, `forked` into an agent of its own, or
+  `command` for a `/skill` you typed or a preload), its source or plugin, how
+  long it took and its arguments; then the count per skill.
+- **FILES CHANGED** — every file this chat changed through Edit, Write,
+  NotebookEdit, or a Bash command the engine diffed: `+added −removed`, a
+  small diff bar, the share of the file that changed (changed lines, the max of
+  + and −, over the file's lines before its first change; `new` for a created
+  file), the number of edits, which loops made them, and when last.
+
 - **Header** — phase of the main loop (idle, thinking, tools), time inside the
   turn, turn count, uptime, current model and effort, task title, project and
   branch, the last turn's duration, tokens, calls and cost delta.
@@ -122,9 +139,12 @@ is written in the PDF's place and can be printed to PDF from any browser.
   last-turn delta and average per turn.
 - **TOKENS** — uncached input, cache read, cache write, output; cache hit rate,
   call count, output-to-input ratio; then each model's share, calls and hit rate.
-- **ORCHESTRATION** — the main loop and every subagent nested under its parent:
-  status, type, name, model, elapsed, tokens, tool calls, background flag, tools
-  running right now, task description. Below it a per-agent-type summary.
+- **ORCHESTRATION** — the main loop and every subagent nested under the loop that
+  started it: status, type, name, model, elapsed, tokens, tool calls, files
+  changed, how it was started (Agent tool, workflow, fork, teammate, a forked
+  skill), background flag, its task, and for a live one what it is doing now.
+  Agents no spawn announced (a forked skill) are picked up from the engine's
+  agent list. Below it a per-agent-type summary.
 - **ACTIVE TOOLS** — tool calls in flight, with elapsed time, owner and a short
   argument summary.
 - **TOOLS** — top tools by call count, with errors, total and average duration.
