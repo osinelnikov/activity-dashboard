@@ -44,6 +44,8 @@ import {
   total,
   untilIso,
 } from './format'
+import { meterRow, nextChartMode, paletteOf, shareChart, textBar } from './charts'
+import type { ChartOptions, ChartTable, Slice } from './charts'
 import { expandPath, labelPath, parseReportArgs } from './paths'
 import type { ReportKind } from './paths'
 import { aggregateToHtml, aggregateToMarkdown, buildRecord, chatSummary, parseRecord, recordToHtml, recordToMarkdown } from './report'
@@ -100,7 +102,16 @@ const viewAtom = atom({ plugin: 'activity-dashboard', key: 'view' } as const, {
   showSteps: true,
   showModels: true,
   showTime: true,
+  chart: 'bars',
+  dark: false,
 } as DashView)
+
+/** Fixed palette slots by name, alphabetical, so a tool or model keeps its color whatever its rank. */
+const slotsByName = (names: readonly string[]): Map<string, number> => {
+  const m = new Map<string, number>()
+  ;[...new Set(names)].sort((a, b) => a.localeCompare(b)).forEach((n, i) => m.set(n, i % 8))
+  return m
+}
 
 // ---------------------------------------------------------------------------
 // State writers
@@ -577,11 +588,18 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: COMMAND,
       description: 'Activity dashboard: live model, agents, orchestration, time, tokens, cost; summary and PDF reports',
-      argumentHint: '[summary|sessions|report [md|pdf|html] [all|<id>] [<folder>]|reportdir [<folder>]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
+      argumentHint: '[summary|sessions|report [md|pdf|html] [all|<id>] [<folder>]|reportdir [<folder>]|chart [bars|stacked|donut]|title <text>|reset|close|breakdown|tools|log|steps|models|time]',
     })
     const now = await $.clock.now()
     const model = await learnSession($)
     await update($, mainAtom, m => ({ ...m, startedAt: m.startedAt || now, phase: 'idle' as const }))
+    try {
+      const settings = (await $.settings.read()) as Record<string, unknown>
+      const theme = typeof settings.theme === 'string' ? settings.theme : ''
+      await update($, viewAtom, v => ({ ...v, chart: v.chart ?? 'bars', dark: theme.startsWith('dark') }))
+    } catch {
+      // no settings to read: the light palette stands
+    }
     await update($, timeAtom, t => ({ ...t, idleSince: t.idleSince ?? now }))
     try {
       const u = await $.session.usage()
@@ -662,6 +680,12 @@ export const register: Register = (on, options) => {
       case 'time':
         await toggleView($, 'showTime')
         return { text: 'Activity dashboard: time section toggled.' }
+      case 'chart': {
+        const wanted = (rest[0] ?? '').toLowerCase()
+        const pick = wanted === 'bars' || wanted === 'stacked' || wanted === 'donut' ? wanted : undefined
+        const v = await update($, viewAtom, x => ({ ...x, chart: pick ?? nextChartMode(x.chart) }))
+        return { text: `Activity dashboard: charts drawn as ${v.chart}.` }
+      }
       default: {
         const placed = await $.ui.open({ id: PANE, title: TITLE, focus: true })
         return {
@@ -914,6 +938,7 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button } = $.ui.resolve(e)
+    const t: ChartTable = e.surface === 'terminal' ? { Box, Text } : { Box, Text, Svg: $.ui.resolve(e).Svg }
     const now = await $.clock.now()
     const [main, usage, agents, ctx, tools, active, steps, events, view, turns, time] = await Promise.all([
       read($, mainAtom),
@@ -930,29 +955,47 @@ export const register: Register = (on, options) => {
     ])
 
     const W = clamp(e.props.bodyColumns ?? e.viewport?.columns ?? 80, 36, 160)
-    const BAR = clamp(W - 34, 8, 30)
+    const inner = W - 4
     const LABEL = 9
-    const rows: RenderNode[] = []
+    const BAR = clamp(inner - LABEL - 26, 8, 36)
+    const mode = view.chart
+    const blocks: RenderNode[] = []
 
-    const header = (text: string) =>
-      rows.push(
-        <Text bold color="claude">
-          {text}
-        </Text>,
+    const section = (title: string, right: string | undefined, children: RenderNode[]) =>
+      blocks.push(
+        <Box flexDirection="column" borderStyle="round" borderDimColor paddingX={1}>
+          <Box flexDirection="row" justifyContent="space-between" gap={1}>
+            <Text bold color="claude">
+              {title}
+            </Text>
+            <Text dimColor wrap="truncate-start">
+              {right ?? ''}
+            </Text>
+          </Box>
+          {children}
+        </Box>,
       )
-    const dim = (text: string) => rows.push(<Text dimColor>{cut(text, W)}</Text>)
-    const barRow = (label: string, frac: number, color: string, tail: string, width = BAR) => {
-      const b = barOf(frac, width)
-      rows.push(
-        <Text wrap="truncate-end">
-          {pad(label, LABEL)}
-          <Text color={color}>{b.filled}</Text>
-          <Text dimColor>{b.empty}</Text> {tail}
-        </Text>,
-      )
-    }
+    const dimLine = (s: string): RenderNode => (
+      <Text dimColor wrap="truncate-end">
+        {cut(s, inner)}
+      </Text>
+    )
+    const labelRow = (label: string, value: RenderNode): RenderNode => (
+      <Box flexDirection="row" gap={1}>
+        <Box width={LABEL}>
+          <Text dimColor>{pad(label, LABEL)}</Text>
+        </Box>
+        <Box flexGrow={1}>{value}</Box>
+      </Box>
+    )
+    const subTitle = (s: string): RenderNode => (
+      <Text bold dimColor>
+        {s}
+      </Text>
+    )
+    const opts = (center?: string, note?: string): ChartOptions => ({ width: inner, dark: view.dark, center, note })
 
-    // ---- 1. header: session, phase, uptime ------------------------------
+    // ---- 1. header ------------------------------------------------------
     const uptime = main.startedAt ? fmtMs(now - main.startedAt) : '—'
     const phase =
       main.phase === 'idle'
@@ -961,314 +1004,376 @@ export const register: Register = (on, options) => {
           ? { glyph: '◆', text: `tools${active.length ? ` (${active.length})` : ''}`, color: 'warning' }
           : { glyph: '●', text: 'thinking', color: 'claude' }
     const inTurn = main.phase !== 'idle' && main.turnStartedAt ? ` ${fmtMs(now - main.turnStartedAt)}` : ''
-    rows.push(
-      <Text wrap="truncate-end">
-        <Text bold>ACTIVITY</Text>
-        {'  '}
-        <Text color={phase.color} bold>
-          {phase.glyph} {phase.text}
-          {inTurn}
-        </Text>
-        <Text dimColor>
-          {'  '}turns {String(main.turns)} · up {uptime}
-        </Text>
-      </Text>,
-    )
-    const effort = main.effort ? `  effort ${main.effort}` : ''
-    const stepInfo = main.phase !== 'idle' ? `  step ${String(main.stepIndex + 1)} · ${String(main.messageCount)} msgs` : ''
-    rows.push(
-      <Text wrap="truncate-end">
-        {pad('model', LABEL)}
-        <Text bold color="claude">
-          {shortModel(main.model || main.sessionModel)}
-        </Text>
-        <Text dimColor>
-          {main.model && main.sessionModel && main.model !== main.sessionModel ? `  (session: ${shortModel(main.sessionModel)})` : ''}
-          {effort}
-          {stepInfo}
-        </Text>
-      </Text>,
-    )
-    if (main.title) {
-      rows.push(
+    const effort = main.effort ? ` · effort ${main.effort}` : ''
+    const stepInfo = main.phase !== 'idle' ? ` · step ${String(main.stepIndex + 1)} · ${String(main.messageCount)} msgs` : ''
+    const headerRows: RenderNode[] = [
+      labelRow(
+        'status',
         <Text wrap="truncate-end">
-          {pad('task', LABEL)}
-          <Text>{cut(main.title, Math.max(10, W - LABEL - 2))}</Text>
+          <Text color={phase.color} bold>
+            {phase.glyph} {phase.text}
+            {inTurn}
+          </Text>
+          <Text dimColor>
+            {'  '}turns {String(main.turns)} · up {uptime}
+          </Text>
         </Text>,
-      )
-    }
-    dim(`${pad('where', LABEL)}${main.repo ?? cut(main.cwd, 40)}${main.branch ? ` @ ${main.branch}` : ''}${main.sessionId ? ` · ${main.sessionId.slice(0, 8)}` : ''}`)
+      ),
+      labelRow(
+        'model',
+        <Text wrap="truncate-end">
+          <Text bold color="claude">
+            {shortModel(main.model || main.sessionModel)}
+          </Text>
+          <Text dimColor>
+            {main.model && main.sessionModel && main.model !== main.sessionModel ? ` (session: ${shortModel(main.sessionModel)})` : ''}
+            {effort}
+            {stepInfo}
+          </Text>
+        </Text>,
+      ),
+    ]
+    if (main.title) headerRows.push(labelRow('task', <Text wrap="truncate-end">{cut(main.title, inner - LABEL - 1)}</Text>))
+    headerRows.push(
+      labelRow(
+        'where',
+        <Text dimColor wrap="truncate-end">
+          {`${main.repo ?? cut(main.cwd, 40)}${main.branch ? ` @ ${main.branch}` : ''}${main.sessionId ? ` · ${main.sessionId.slice(0, 8)}` : ''}`}
+        </Text>,
+      ),
+    )
     if (main.lastTurnMs !== undefined) {
       const lu = main.lastTurnUsage
-      dim(
-        `${pad('last turn', LABEL)}${fmtMs(main.lastTurnMs)}${lu ? ` · in ${fmtTok(inputOf(lu))} out ${fmtTok(lu.output)} · ${String(lu.calls)} calls` : ''}${main.lastTurnCostUsd !== undefined ? ` · +${fmtUsd(main.lastTurnCostUsd)}` : ''}`,
+      headerRows.push(
+        labelRow(
+          'last turn',
+          <Text dimColor wrap="truncate-end">
+            {`${fmtMs(main.lastTurnMs)}${lu ? ` · in ${fmtTok(inputOf(lu))} out ${fmtTok(lu.output)} · ${String(lu.calls)} calls` : ''}${main.lastTurnCostUsd !== undefined ? ` · +${fmtUsd(main.lastTurnCostUsd)}` : ''}`}
+          </Text>,
+        ),
       )
     }
-    rows.push(<Text> </Text>)
+    section('ACTIVITY', `chart: ${mode}`, headerRows)
 
     // ---- 2. time ----------------------------------------------------------
     if (view.showTime) {
       const wall = Math.max(1, now - (main.startedAt || now))
       const waiting = time.waitMs + (time.idleSince !== undefined ? Math.max(0, now - time.idleSince) : 0)
-      const liveModel = time.modelMs
-      const liveAgents = time.agentMs + agents.filter(a => a.endedAt === undefined).reduce((n, a) => n + (now - a.startedAt), 0)
-      const activeMs = turns.reduce((n, t) => n + (t.ms ?? now - t.startedAt), 0)
-      header('TIME')
-      dim(`${pad('', LABEL)}wall ${fmtMs(wall)} · active ${fmtMs(activeMs)} · waiting ${fmtMs(waiting)} · ${String(turns.length)} turns`)
-      barRow('model', liveModel / wall, 'claude', `${padL(fmtMs(liveModel), 7)}  ${String(Math.round(pct(liveModel, wall)))}%`)
-      barRow('tools', time.toolMs / wall, 'warning', `${padL(fmtMs(time.toolMs), 7)}  ${String(Math.round(pct(time.toolMs, wall)))}%`)
-      barRow('agents', liveAgents / wall, 'planMode', `${padL(fmtMs(liveAgents), 7)}  ${String(Math.round(pct(liveAgents, wall)))}%`)
-      barRow('waiting', waiting / wall, 'inactive', `${padL(fmtMs(waiting), 7)}  ${String(Math.round(pct(waiting, wall)))}%`)
-      if (turns.length) {
-        const done = turns.filter(t => t.ms !== undefined)
-        const longest = done.reduce<DashTurn | undefined>((b, t) => ((t.ms ?? 0) > (b?.ms ?? -1) ? t : b), undefined)
-        const avg = done.length ? done.reduce((n, t) => n + (t.ms ?? 0), 0) / done.length : 0
-        dim(`${pad('', LABEL)}avg turn ${fmtMs(avg)}${longest ? ` · longest #${String(longest.index)} ${fmtMs(longest.ms ?? 0)}: ${cut(longest.prompt, 30)}` : ''}`)
-      }
-      rows.push(<Text> </Text>)
+      const fgAgents = agents.filter(a => !a.background && !a.parentId).reduce((n, a) => n + ((a.endedAt ?? now) - a.startedAt), 0)
+      const bgAgents = agents.filter(a => a.background && !a.parentId).reduce((n, a) => n + ((a.endedAt ?? now) - a.startedAt), 0)
+      const other = Math.max(0, wall - time.modelMs - time.toolMs - waiting - fgAgents)
+      const activeMs = turns.reduce((n, x) => n + (x.ms ?? now - x.startedAt), 0)
+      const slices: Slice[] = [
+        { label: 'model', value: time.modelMs, text: fmtMs(time.modelMs), slot: 0 },
+        { label: 'tools', value: time.toolMs, text: fmtMs(time.toolMs), slot: 1 },
+        { label: 'agents', value: fgAgents, text: fmtMs(fgAgents), slot: 2 },
+        { label: 'waiting', value: waiting, text: fmtMs(waiting), slot: 3 },
+        { label: 'other', value: other, text: fmtMs(other), slot: 6 },
+      ]
+      const done = turns.filter(x => x.ms !== undefined)
+      const longest = done.reduce<DashTurn | undefined>((b, x) => ((x.ms ?? 0) > (b?.ms ?? -1) ? x : b), undefined)
+      const avg = done.length ? done.reduce((n, x) => n + (x.ms ?? 0), 0) / done.length : 0
+      section('TIME', `wall ${fmtMs(wall)} · active ${fmtMs(activeMs)}`, [
+        shareChart(t, mode, slices, wall, opts(fmtMs(wall), bgAgents > 0 ? `background agents ${fmtMs(bgAgents)} ran alongside the above` : undefined)),
+        dimLine(`${String(turns.length)} turns · avg ${fmtMs(avg)}${longest ? ` · longest #${String(longest.index)} ${fmtMs(longest.ms ?? 0)}: ${cut(longest.prompt, 36)}` : ''}`),
+      ])
     }
 
-    // ---- 3. context window ----------------------------------------------
-    header('CONTEXT')
-    if (ctx.window > 0) {
-      const p = ctx.percent ?? (ctx.tokens !== undefined ? (ctx.tokens / ctx.window) * 100 : 0)
-      barRow('window', p / 100, pctColor(p), `${padL(`${Math.round(p)}%`, 4)}  ${fmtTok(ctx.tokens ?? 0)} / ${fmtTok(ctx.window)}`)
-      const extra: string[] = []
-      if (ctx.autoCompactThreshold !== undefined) {
-        extra.push(`autocompact at ${ctx.autoCompactThreshold <= 100 ? `${String(ctx.autoCompactThreshold)}%` : fmtTok(ctx.autoCompactThreshold)}`)
+    // ---- 3. context, limits, cost ---------------------------------------
+    {
+      const rows: RenderNode[] = []
+      const palette = paletteOf(view.dark)
+      if (ctx.window > 0) {
+        const p = ctx.percent ?? (ctx.tokens !== undefined ? (ctx.tokens / ctx.window) * 100 : 0)
+        rows.push(meterRow(t, 'window', p / 100, pctColor(p), `${padL(`${Math.round(p)}%`, 4)}  ${fmtTok(ctx.tokens ?? 0)} / ${fmtTok(ctx.window)}`, LABEL, BAR))
+        const extra: string[] = []
+        if (ctx.autoCompactThreshold !== undefined) {
+          extra.push(`autocompact at ${ctx.autoCompactThreshold <= 100 ? `${String(ctx.autoCompactThreshold)}%` : fmtTok(ctx.autoCompactThreshold)}`)
+        }
+        if (ctx.maxPercent !== undefined && ctx.maxPercent > 0) extra.push(`peak ${String(Math.round(ctx.maxPercent))}%`)
+        if (ctx.compactions > 0) {
+          const lc = ctx.lastCompaction
+          extra.push(`compactions ${String(ctx.compactions)}${lc && lc.before !== undefined && lc.after !== undefined ? ` (last ${fmtTok(lc.before)} → ${fmtTok(lc.after)})` : ''}`)
+        }
+        if (extra.length) rows.push(dimLine(`${pad('', LABEL)} ${extra.join(' · ')}`))
+        if (ctx.breakdown && ctx.breakdown.length) {
+          const used = ctx.breakdown.filter(r => r.kind === 'used' && r.tokens > 0).sort((a, b) => b.tokens - a.tokens)
+          const max = ctx.breakdownMax || Math.max(1, ...used.map(r => r.tokens))
+          rows.push(subTitle('what fills it'))
+          rows.push(
+            shareChart(
+              t,
+              mode === 'bars' ? 'bars' : 'stacked',
+              used.map((r, i) => ({ label: r.name.toLowerCase(), value: r.tokens, text: fmtTok(r.tokens), slot: i })),
+              max,
+              { width: inner, dark: view.dark, maxRows: 8 },
+            ),
+          )
+        }
+      } else {
+        rows.push(dimLine('waiting for the first measurement…'))
       }
-      if (ctx.maxPercent !== undefined && ctx.maxPercent > 0) extra.push(`peak ${String(Math.round(ctx.maxPercent))}%`)
-      if (ctx.compactions > 0) {
-        const lc = ctx.lastCompaction
-        extra.push(
-          `compactions ${String(ctx.compactions)}${lc && lc.before !== undefined && lc.after !== undefined ? ` (last ${fmtTok(lc.before)} → ${fmtTok(lc.after)})` : ''}`,
+      for (const r of ctx.rateLimits) {
+        const label = r.kind === 'five_hour' ? 'limit 5h' : r.kind === 'seven_day' ? 'limit 7d' : cut(r.kind, LABEL)
+        rows.push(meterRow(t, label, r.percentUsed / 100, pctColor(r.percentUsed), `${padL(`${String(r.percentUsed)}%`, 5)}  ${untilIso(r.resetsAt, now)}`, LABEL, BAR))
+      }
+      if (ctx.costUsd !== undefined) {
+        rows.push(
+          labelRow(
+            'cost',
+            <Text wrap="truncate-end">
+              <Text bold>{fmtUsd(ctx.costUsd)}</Text>
+              <Text dimColor>
+                {main.lastTurnCostUsd !== undefined ? `  (+${fmtUsd(main.lastTurnCostUsd)} last turn)` : ''}
+                {main.turns > 0 ? `  ~${fmtUsd(ctx.costUsd / main.turns)}/turn` : ''}
+              </Text>
+            </Text>,
+          ),
         )
       }
-      if (extra.length) dim(`${pad('', LABEL)}${extra.join(' · ')}`)
-      if (ctx.breakdown && ctx.breakdown.length) {
-        const used = ctx.breakdown.filter(r => r.kind === 'used' && r.tokens > 0).sort((a, b) => b.tokens - a.tokens)
-        const max = ctx.breakdownMax || Math.max(1, ...used.map(r => r.tokens))
-        for (const r of used.slice(0, 8)) {
-          barRow(` ${cut(r.name, LABEL - 1)}`, r.tokens / max, 'permission', `${padL(fmtTok(r.tokens), 7)}  ${String(Math.round((r.tokens / max) * 100))}%`, Math.max(6, BAR - 6))
-        }
-      }
-    } else {
-      dim(`${pad('window', LABEL)}waiting for the first measurement…`)
+      void palette
+      section('CONTEXT & COST', ctx.measuredAt ? `measured ${fmtClock(ctx.measuredAt)}` : undefined, rows)
     }
 
-    // ---- 4. rate limits & cost ------------------------------------------
-    if (ctx.rateLimits.length) {
-      for (const r of ctx.rateLimits) {
-        const label = r.kind === 'five_hour' ? '5h' : r.kind === 'seven_day' ? '7d' : cut(r.kind, LABEL - 1)
-        barRow(`limit ${label}`, r.percentUsed / 100, pctColor(r.percentUsed), `${padL(`${String(r.percentUsed)}%`, 5)}  ${untilIso(r.resetsAt, now)}`)
+    // ---- 4. tokens --------------------------------------------------------
+    {
+      const models = Object.entries(usage).sort((a, b) => total(b[1]) - total(a[1]))
+      const grand = models.reduce((acc, [, u]) => addUsageInto(acc, u), emptyUsage())
+      const rows: RenderNode[] = []
+      if (grand.calls === 0) rows.push(dimLine('no model calls yet'))
+      else {
+        const slices: Slice[] = [
+          { label: 'input (uncached)', value: grand.input, text: fmtTok(grand.input), slot: 1 },
+          { label: 'cache read', value: grand.cacheRead, text: fmtTok(grand.cacheRead), slot: 2 },
+          { label: 'cache write', value: grand.cacheWrite, text: fmtTok(grand.cacheWrite), slot: 6 },
+          { label: 'output', value: grand.output, text: fmtTok(grand.output), slot: 0 },
+        ]
+        rows.push(shareChart(t, mode, slices, total(grand), opts(fmtTok(total(grand)))))
+        rows.push(dimLine(`${String(grand.calls)} calls · cache hit ${String(Math.round(cacheHit(grand)))}% · out/in ${pct(grand.output, Math.max(1, inputOf(grand))).toFixed(1)}%`))
+        if (view.showModels && models.length) {
+          const slotOf = slotsByName(models.map(([n]) => shortModel(n)))
+          rows.push(subTitle('by model'))
+          rows.push(
+            shareChart(
+              t,
+              mode,
+              models.map(([name, u]) => ({ label: shortModel(name), value: total(u), text: `${fmtTok(total(u))} · ${String(u.calls)}×`, slot: slotOf.get(shortModel(name)) ?? 7 })),
+              total(grand),
+              opts(fmtTok(total(grand)), models.map(([name, u]) => `${shortModel(name)} hit ${String(Math.round(cacheHit(u)))}%`).join(' · ')),
+            ),
+          )
+        }
       }
+      section('TOKENS', grand.calls ? `${fmtTok(total(grand))} total` : undefined, rows)
     }
-    if (ctx.costUsd !== undefined) {
+
+    // ---- 5. orchestration -------------------------------------------------
+    {
+      const rows: RenderNode[] = []
+      const mainActive = active.filter(a => !a.agentId)
       rows.push(
         <Text wrap="truncate-end">
-          {pad('cost', LABEL)}
-          <Text bold>{fmtUsd(ctx.costUsd)}</Text>
+          <Text color={phase.color}>{phase.glyph}</Text> <Text bold>main</Text>
           <Text dimColor>
-            {main.lastTurnCostUsd !== undefined ? `  (+${fmtUsd(main.lastTurnCostUsd)} last turn)` : ''}
-            {main.turns > 0 ? `  ~${fmtUsd(ctx.costUsd / main.turns)}/turn` : ''}
+            {'  '}
+            {shortModel(main.model || main.sessionModel)}
+            {main.effort ? ` · ${main.effort}` : ''}
+            {mainActive.length ? ` · ${mainActive.map(a => toolLabel(a.tool)).join(', ')}` : ''}
           </Text>
         </Text>,
       )
-    }
-    rows.push(<Text> </Text>)
-
-    // ---- 5. tokens ------------------------------------------------------
-    header('TOKENS')
-    const models = Object.entries(usage).sort((a, b) => total(b[1]) - total(a[1]))
-    const grand = models.reduce((acc, [, u]) => addUsageInto(acc, u), emptyUsage())
-    if (grand.calls === 0) {
-      dim(`${pad('', LABEL)}no model calls yet`)
-    } else {
-      const maxPart = Math.max(1, grand.input, grand.output, grand.cacheRead, grand.cacheWrite)
-      barRow('input', grand.input / maxPart, 'warning', padL(fmtTok(grand.input), 7) + '  uncached')
-      barRow('cache ←', grand.cacheRead / maxPart, 'success', padL(fmtTok(grand.cacheRead), 7) + '  read')
-      barRow('cache →', grand.cacheWrite / maxPart, 'permission', padL(fmtTok(grand.cacheWrite), 7) + '  written')
-      barRow('output', grand.output / maxPart, 'claude', padL(fmtTok(grand.output), 7) + '  generated')
-      const hit = cacheHit(grand)
-      dim(
-        `${pad('', LABEL)}${String(grand.calls)} calls · cache hit ${String(Math.round(hit))}% · total ${fmtTok(total(grand))} · out/in ${pct(grand.output, Math.max(1, inputOf(grand))).toFixed(1)}%`,
-      )
-      if (view.showModels && models.length) {
-        const all = Math.max(1, total(grand))
-        for (const [name, u] of models.slice(0, 6)) {
-          const share = total(u) / all
-          barRow(
-            cut(shortModel(name), LABEL - 1),
-            share,
-            'claude',
-            `${padL(`${String(Math.round(share * 100))}%`, 4)}  ${String(u.calls)} calls · in ${fmtTok(inputOf(u))} out ${fmtTok(u.output)} · hit ${String(Math.round(cacheHit(u)))}%`,
-            Math.max(6, BAR - 6),
-          )
-        }
-      }
-    }
-    rows.push(<Text> </Text>)
-
-    // ---- 6. orchestration tree -----------------------------------------
-    header('ORCHESTRATION')
-    const mainActive = active.filter(a => !a.agentId)
-    rows.push(
-      <Text wrap="truncate-end">
-        <Text color={phase.color}>{phase.glyph}</Text> <Text bold>main</Text>
-        <Text dimColor>
-          {'  '}
-          {shortModel(main.model || main.sessionModel)}
-          {main.effort ? ` · ${main.effort}` : ''}
-          {mainActive.length ? ` · ${mainActive.map(a => toolLabel(a.tool)).join(', ')}` : ''}
-        </Text>
-      </Text>,
-    )
-    const childrenOf = (parent: string | undefined): DashAgent[] =>
-      agents.filter(a => (a.parentId ?? undefined) === parent || (parent === undefined && a.parentId !== undefined && !agents.some(p => p.id === a.parentId)))
-    const drawAgents = (parent: string | undefined, prefix: string, depth: number) => {
-      const kids = childrenOf(parent)
-      kids.forEach((a, i) => {
-        const last = i === kids.length - 1
-        const branch = `${prefix}${last ? '└─ ' : '├─ '}`
-        const g = statusGlyph(a.status)
-        const elapsed = fmtMs((a.endedAt ?? now) - a.startedAt)
-        const running = active.filter(t => t.agentId === a.id)
-        rows.push(
-          <Text wrap="truncate-end">
-            <Text dimColor>{branch}</Text>
-            <Text color={g.color}>{g.glyph}</Text> <Text bold={!isDoneStatus(a.status)}>{cut(a.name ? `${a.type} "${a.name}"` : a.type, 28)}</Text>
-            <Text dimColor>
-              {'  '}
-              {shortModel(a.model)} · {elapsed} · {fmtTok(total(a.usage))} tok · {String(a.toolCalls)} tools
-              {a.background ? ' · bg' : ''}
-              {running.length ? ` · ${running.map(t => toolLabel(t.tool)).join(', ')}` : ''}
-            </Text>
-          </Text>,
-        )
-        if (a.description) {
+      const childrenOf = (parent: string | undefined): DashAgent[] =>
+        agents.filter(a => (a.parentId ?? undefined) === parent || (parent === undefined && a.parentId !== undefined && !agents.some(p => p.id === a.parentId)))
+      const drawAgents = (parent: string | undefined, prefix: string, depth: number) => {
+        const kids = childrenOf(parent)
+        kids.forEach((a, i) => {
+          const last = i === kids.length - 1
+          const branch = `${prefix}${last ? '└─ ' : '├─ '}`
+          const g = statusGlyph(a.status)
+          const elapsed = fmtMs((a.endedAt ?? now) - a.startedAt)
+          const running = active.filter(x => x.agentId === a.id)
           rows.push(
-            <Text wrap="truncate-end" dimColor>
-              {`${prefix}${last ? '   ' : '│  '}  ${cut(a.description, Math.max(10, W - prefix.length - 6))}`}
+            <Text wrap="truncate-end">
+              <Text dimColor>{branch}</Text>
+              <Text color={g.color}>{g.glyph}</Text> <Text bold={!isDoneStatus(a.status)}>{cut(a.name ? `${a.type} "${a.name}"` : a.type, 28)}</Text>
+              <Text dimColor>
+                {'  '}
+                {shortModel(a.model)} · {elapsed} · {fmtTok(total(a.usage))} tok · {String(a.toolCalls)} tools
+                {a.background ? ' · bg' : ''}
+                {running.length ? ` · ${running.map(x => toolLabel(x.tool)).join(', ')}` : ''}
+              </Text>
             </Text>,
           )
+          if (a.description) {
+            rows.push(
+              <Text wrap="truncate-end" dimColor>
+                {`${prefix}${last ? '   ' : '│  '}  ${cut(a.description, Math.max(10, inner - prefix.length - 6))}`}
+              </Text>,
+            )
+          }
+          if (depth < 6) drawAgents(a.id, `${prefix}${last ? '   ' : '│  '}`, depth + 1)
+        })
+      }
+      drawAgents(undefined, '', 0)
+      if (agents.length) {
+        const byType = new Map<string, { count: number; tokens: number; live: number; ms: number }>()
+        for (const a of agents) {
+          const x = byType.get(a.type) ?? { count: 0, tokens: 0, live: 0, ms: 0 }
+          x.count += 1
+          x.tokens += total(a.usage)
+          x.live += isDoneStatus(a.status) ? 0 : 1
+          x.ms += (a.endedAt ?? now) - a.startedAt
+          byType.set(a.type, x)
         }
-        if (depth < 6) drawAgents(a.id, `${prefix}${last ? '   ' : '│  '}`, depth + 1)
-      })
-    }
-    drawAgents(undefined, '', 0)
-    if (agents.length) {
-      const byType = new Map<string, { count: number; tokens: number; live: number; ms: number }>()
-      for (const a of agents) {
-        const t = byType.get(a.type) ?? { count: 0, tokens: 0, live: 0, ms: 0 }
-        t.count += 1
-        t.tokens += total(a.usage)
-        t.live += isDoneStatus(a.status) ? 0 : 1
-        t.ms += (a.endedAt ?? now) - a.startedAt
-        byType.set(a.type, t)
-      }
-      const maxTok = Math.max(1, ...[...byType.values()].map(t => t.tokens))
-      dim(`${pad('', LABEL)}by agent type (tokens share):`)
-      for (const [type, t] of [...byType.entries()].sort((a, b) => b[1].tokens - a[1].tokens).slice(0, 6)) {
-        barRow(
-          ` ${cut(type, LABEL - 1)}`,
-          t.tokens / maxTok,
-          'planMode',
-          `${padL(fmtTok(t.tokens), 7)}  ×${String(t.count)}${t.live ? ` (${String(t.live)} live)` : ''} · avg ${fmtMs(t.ms / t.count)}`,
-          Math.max(6, BAR - 6),
-        )
-      }
-    } else {
-      dim(`${pad('', LABEL)}no subagents spawned yet`)
-    }
-    rows.push(<Text> </Text>)
-
-    // ---- 7. active tool calls -------------------------------------------
-    if (active.length) {
-      header(`ACTIVE TOOLS (${String(active.length)})`)
-      for (const t of active.slice(-8)) {
-        const who = t.agentId ? agents.find(a => a.id === t.agentId)?.type ?? 'agent' : 'main'
+        const slotOf = slotsByName([...byType.keys()])
+        const sum = [...byType.values()].reduce((n, x) => n + x.tokens, 0)
+        rows.push(subTitle('by agent type (tokens)'))
         rows.push(
-          <Text wrap="truncate-end">
-            <Text color="warning">◆</Text> <Text bold>{pad(cut(toolLabel(t.tool), 22), 22)}</Text>
-            <Text dimColor>
-              {padL(fmtMs(now - t.startedAt), 7)} · {cut(who, 14)}
-              {t.detail ? ` · ${cut(t.detail, Math.max(10, W - 52))}` : ''}
-            </Text>
-          </Text>,
+          shareChart(
+            t,
+            mode,
+            [...byType.entries()].sort((a, b) => b[1].tokens - a[1].tokens).map(([type, x]) => ({ label: type, value: x.tokens, text: `${fmtTok(x.tokens)} · ×${String(x.count)}${x.live ? ` (${String(x.live)} live)` : ''}`, slot: slotOf.get(type) ?? 7 })),
+            sum,
+            opts(fmtTok(sum), [...byType.entries()].map(([type, x]) => `${type} avg ${fmtMs(x.ms / x.count)}`).join(' · ')),
+          ),
         )
-      }
-      rows.push(<Text> </Text>)
+      } else rows.push(dimLine('no subagents spawned yet'))
+      section('ORCHESTRATION', agents.length ? `${String(agents.filter(a => !isDoneStatus(a.status)).length)} live / ${String(agents.length)}` : undefined, rows)
     }
 
-    // ---- 8. tool statistics --------------------------------------------
+    // ---- 6. active tool calls -------------------------------------------
+    if (active.length) {
+      section(
+        `ACTIVE TOOLS`,
+        String(active.length),
+        active.slice(-8).map(x => {
+          const who = x.agentId ? agents.find(a => a.id === x.agentId)?.type ?? 'agent' : 'main'
+          return (
+            <Box flexDirection="row" gap={1}>
+              <Box width={1}>
+                <Text color="warning">◆</Text>
+              </Box>
+              <Box width={20}>
+                <Text bold wrap="truncate-end">
+                  {cut(toolLabel(x.tool), 20)}
+                </Text>
+              </Box>
+              <Box width={7} justifyContent="flex-end">
+                <Text dimColor>{padL(fmtMs(now - x.startedAt), 7)}</Text>
+              </Box>
+              <Box flexGrow={1}>
+                <Text dimColor wrap="truncate-end">
+                  {`${cut(who, 14)}${x.detail ? ` · ${x.detail}` : ''}`}
+                </Text>
+              </Box>
+            </Box>
+          )
+        }),
+      )
+    }
+
+    // ---- 7. tools ---------------------------------------------------------
     if (view.showTools) {
       const list = Object.values(tools).sort((a, b) => b.calls - a.calls)
-      header(`TOOLS (${String(list.reduce((n, t) => n + t.calls, 0))} calls · ${fmtMs(list.reduce((n, t) => n + t.totalMs, 0))})`)
-      if (!list.length) dim(`${pad('', LABEL)}no tool calls yet`)
-      const maxCalls = Math.max(1, ...list.map(t => t.calls))
-      for (const t of list.slice(0, 10)) {
-        barRow(
-          cut(toolLabel(t.name), LABEL - 1),
-          t.calls / maxCalls,
-          t.errors ? 'warning' : 'success',
-          `${padL(String(t.calls), 4)}${t.errors ? ` ✗${String(t.errors)}` : '   '}  ${padL(fmtMs(t.totalMs), 7)} · avg ${fmtMs(t.totalMs / t.calls)}`,
-          Math.max(6, BAR - 6),
-        )
-      }
-      rows.push(<Text> </Text>)
+      const calls = list.reduce((n, x) => n + x.calls, 0)
+      const errors = list.reduce((n, x) => n + x.errors, 0)
+      const slotOf = slotsByName(list.map(x => toolLabel(x.name)))
+      section('TOOLS', list.length ? `${String(calls)} calls · ${fmtMs(list.reduce((n, x) => n + x.totalMs, 0))}${errors ? ` · ${String(errors)} failed` : ''}` : undefined, [
+        list.length
+          ? shareChart(
+              t,
+              mode,
+              list.map(x => ({ label: toolLabel(x.name), value: x.calls, text: `${String(x.calls)}×${x.errors ? ` ✗${String(x.errors)}` : ''} · ${fmtMs(x.totalMs / x.calls)}`, slot: slotOf.get(toolLabel(x.name)) ?? 7 })),
+              calls,
+              { ...opts(String(calls)), maxRows: 8 },
+            )
+          : dimLine('no tool calls yet'),
+      ])
     }
 
-    // ---- 9. recent model steps -----------------------------------------
+    // ---- 8. recent model calls ------------------------------------------
     if (view.showSteps && steps.length) {
-      header('RECENT MODEL CALLS (in / out)')
       const recent = steps.slice(-8)
       const maxIn = Math.max(1, ...recent.map(s => s.input + s.cacheRead + s.cacheWrite))
       const maxOut = Math.max(1, ...recent.map(s => s.output))
-      const half = Math.max(4, Math.floor((BAR - 1) / 2))
-      for (const s of recent) {
-        const inp = s.input + s.cacheRead + s.cacheWrite
-        const bi = barOf(inp / maxIn, half)
-        const bo = barOf(s.output / maxOut, half)
-        const who = s.agentId ? agents.find(a => a.id === s.agentId)?.type ?? 'agent' : 'main'
-        rows.push(
-          <Text wrap="truncate-end">
-            <Text dimColor>{fmtClock(s.at)} </Text>
-            {pad(cut(shortModel(s.model), 10), 10)} <Text color="success">{bi.filled}</Text>
-            <Text dimColor>{bi.empty}</Text> <Text color="claude">{bo.filled}</Text>
-            <Text dimColor>{bo.empty}</Text>
-            <Text dimColor>
-              {' '}
-              {padL(fmtTok(inp), 6)}/{pad(fmtTok(s.output), 6)} {fmtMs(s.ms)} · {cut(who, 12)}
-              {s.stopReason && s.stopReason !== 'end_turn' && s.stopReason !== 'tool_use' ? ` · ${s.stopReason}` : ''}
-            </Text>
-          </Text>,
-        )
-      }
-      rows.push(<Text> </Text>)
+      const half = clamp(Math.floor((inner - 44) / 2), 4, 16)
+      const palette = paletteOf(view.dark)
+      section('RECENT MODEL CALLS', 'in ■ out ■', [
+        <Box flexDirection="row" gap={1}>
+          <Box width={8}>
+            <Text dimColor>time</Text>
+          </Box>
+          <Box width={10}>
+            <Text dimColor>model</Text>
+          </Box>
+          <Box width={half}>
+            <Text color={palette[2]}>in</Text>
+          </Box>
+          <Box width={half}>
+            <Text color={palette[0]}>out</Text>
+          </Box>
+          <Box flexGrow={1}>
+            <Text dimColor>in/out · time · who</Text>
+          </Box>
+        </Box>,
+        ...recent.map(s => {
+          const inp = s.input + s.cacheRead + s.cacheWrite
+          const who = s.agentId ? agents.find(a => a.id === s.agentId)?.type ?? 'agent' : 'main'
+          return (
+            <Box flexDirection="row" gap={1}>
+              <Box width={8}>
+                <Text dimColor>{fmtClock(s.at)}</Text>
+              </Box>
+              <Box width={10}>
+                <Text wrap="truncate-end">{cut(shortModel(s.model), 10)}</Text>
+              </Box>
+              <Box width={half}>{textBar(t, inp / maxIn, half, palette[2] ?? 'success')}</Box>
+              <Box width={half}>{textBar(t, s.output / maxOut, half, palette[0] ?? 'claude')}</Box>
+              <Box flexGrow={1}>
+                <Text dimColor wrap="truncate-end">
+                  {`${fmtTok(inp)}/${fmtTok(s.output)} · ${fmtMs(s.ms)} · ${cut(who, 12)}${s.stopReason && s.stopReason !== 'end_turn' && s.stopReason !== 'tool_use' ? ` · ${s.stopReason}` : ''}`}
+                </Text>
+              </Box>
+            </Box>
+          )
+        }),
+      ])
     }
 
-    // ---- 10. log ---------------------------------------------------------
+    // ---- 9. log -----------------------------------------------------------
     if (view.showLog) {
-      header('LOG')
-      if (!events.length) dim(`${pad('', LABEL)}—`)
-      for (const ev of events.slice(-8)) {
-        const color = ev.kind === 'ok' ? 'success' : ev.kind === 'warn' ? 'warning' : ev.kind === 'error' ? 'error' : 'text'
-        rows.push(
-          <Text wrap="truncate-end">
-            <Text dimColor>{fmtClock(ev.at)} </Text>
-            <Text color={color}>{cut(ev.text, Math.max(10, W - 10))}</Text>
-          </Text>,
-        )
-      }
-      rows.push(<Text> </Text>)
+      section(
+        'LOG',
+        undefined,
+        events.length
+          ? events.slice(-8).map(ev => {
+              const color = ev.kind === 'ok' ? 'success' : ev.kind === 'warn' ? 'warning' : ev.kind === 'error' ? 'error' : 'text'
+              return (
+                <Box flexDirection="row" gap={1}>
+                  <Box width={8}>
+                    <Text dimColor>{fmtClock(ev.at)}</Text>
+                  </Box>
+                  <Box flexGrow={1}>
+                    <Text color={color} wrap="truncate-end">
+                      {ev.text}
+                    </Text>
+                  </Box>
+                </Box>
+              )
+            })
+          : [dimLine('—')],
+      )
     }
 
-    // ---- 11. controls -----------------------------------------------------
+    // ---- 10. controls -----------------------------------------------------
     return (
       <Box flexDirection="column">
-        {rows}
-        <Box flexDirection="row" gap={1} flexWrap="wrap">
-          <Button key="pdf" hotkey="p" plain variant="primary" onPress={() => void makeReport($, 'pdf', '').then(t => $.ui.toast(t))}>
+        {blocks}
+        <Box flexDirection="row" gap={1} flexWrap="wrap" paddingX={1}>
+          <Button key="chart" hotkey="c" plain variant="primary" onPress={() => void update($, viewAtom, v => ({ ...v, chart: nextChartMode(v.chart) }))}>
+            c:chart {nextChartMode(mode)}
+          </Button>
+          <Button key="pdf" hotkey="p" plain onPress={() => void makeReport($, 'pdf', '').then(x => $.ui.toast(x))}>
             p:pdf report
           </Button>
           <Button key="breakdown" hotkey="b" plain onPress={() => void fetchBreakdown($)}>

@@ -108,3 +108,23 @@ test('report arguments and paths are parsed', async () => {
   expect(expandPath('/tmp/x/', '/Users/me', '/work')).toBe('/tmp/x')
   expect(labelPath('/Users/me/.claude/activity-dashboard/reports', '/Users/me')).toBe('~/.claude/activity-dashboard/reports')
 })
+
+test('the chart button cycles the modes and draws SVG where the surface has it', async ($, on) => {
+  mock.clock(on)
+  const desktop = await $.ui.mount({ plugin: 'activity-dashboard', surface: 'desktop', component: 'Pane', requestId: 'activity-dashboard', props: PANE_PROPS })
+  expect(await desktop.find({ type: 'Text', text: /chart: bars/ })).toBeDefined()
+  await desktop.press({ key: 'chart' })
+  expect(await desktop.find({ type: 'Text', text: /chart: stacked/ })).toBeDefined()
+  await desktop.press({ key: 'chart' })
+  expect(await desktop.find({ type: 'Text', text: /chart: donut/ })).toBeDefined()
+  await desktop.press({ key: 'chart' })
+  expect(await desktop.find({ type: 'Text', text: /chart: bars/ })).toBeDefined()
+  await desktop.unmount()
+
+  const terminal = await $.ui.mount({ plugin: 'activity-dashboard', surface: 'terminal', component: 'Pane', requestId: 'activity-dashboard', props: PANE_PROPS })
+  await terminal.press({ key: 'chart' })
+  await terminal.press({ key: 'chart' })
+  expect(await terminal.find({ type: 'Text', text: /chart: donut/ })).toBeDefined()
+  expect(await terminal.find({ type: 'Svg' })).toBeUndefined()
+  await terminal.unmount()
+})

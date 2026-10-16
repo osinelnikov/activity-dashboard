@@ -49,10 +49,24 @@ with the keyboard focus. Arguments:
 | `reset`                           | clears every counter                                                   |
 | `close`                           | closes the pane                                                        |
 | `breakdown`                       | refreshes the context-window breakdown                                 |
+| `chart [bars\|stacked\|donut]`    | how share charts are drawn; no argument cycles the three         |
 | `time`, `models`, `tools`, `steps`, `log` | show or hide a section                                       |
 
-While the pane has the keyboard (ctrl+x tab, or a click), the hotkeys `p`
-(PDF report), `b`, `i`, `m`, `t`, `s`, `l` and `r` do the same.
+While the pane has the keyboard (ctrl+x tab, or a click), the hotkeys `c`
+(chart mode), `p` (PDF report), `b`, `i`, `m`, `t`, `s`, `l` and `r` do the same.
+
+## How it looks
+
+Every section is its own framed block. Shares — time by phase, tokens by kind
+and by model, agents by type, tools by calls — are drawn by one chart in the
+mode you pick: a bar per row, one stacked bar over a legend, or a donut beside
+a legend. The legend always carries a colored marker, the label, the value and
+the percent, laid out on a cell grid so columns line up on every surface. On
+the desktop app, VS Code and mobile the stacked bar and the donut are real SVG;
+in the terminal they are colored text bars. Colors come from a fixed,
+colorblind-checked palette with light and dark steps, picked by your theme
+setting, and each tool, model or agent type keeps its color whatever its rank.
+Meters (context window, rate limits) stay bars colored by threshold.
 
 ## What is recorded
 

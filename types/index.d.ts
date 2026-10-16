@@ -93,12 +93,18 @@ export type DashStep = {
 
 export type DashEvent = { at: number; text: string; kind: 'info' | 'ok' | 'warn' | 'error' }
 
+/** How a share chart is drawn: a bar per item, one stacked bar, or a donut (text bars where no SVG). */
+export type DashChartMode = 'bars' | 'stacked' | 'donut'
+
 export type DashView = {
   showTools: boolean
   showLog: boolean
   showSteps: boolean
   showModels: boolean
   showTime: boolean
+  chart: DashChartMode
+  /** The person's theme is dark: picks the dark palette steps. */
+  dark: boolean
 }
 
 /** One main-loop turn of this chat, with what it cost in time and tokens. */
