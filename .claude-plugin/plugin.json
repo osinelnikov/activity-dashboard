@@ -1,0 +1,7 @@
+{
+  "name": "activity-dashboard",
+  "version": "0.1.0",
+  "description": "Live pane: active model, agents and subagents, orchestration tree, context window, token usage, rate limits, cost and tool stats",
+  "author": { "name": "Oleg Sinelnikov" },
+  "types": "./types/index.d.ts"
+}

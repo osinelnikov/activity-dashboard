@@ -1,0 +1,14 @@
+{
+  "name": "activity-dashboard",
+  "owner": {
+    "name": "Oleg Sinelnikov"
+  },
+  "plugins": [
+    {
+      "name": "activity-dashboard",
+      "source": "./",
+      "description": "Live pane: active model, agents and subagents, orchestration tree, context window, token usage, rate limits, cost and tool stats"
+    }
+  ],
+  "description": "Claude Code mods by Oleg Sinelnikov: live activity dashboard pane"
+}
