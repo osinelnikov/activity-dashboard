@@ -101,6 +101,20 @@ export type DashFile = {
 
 export type DashRateLimit = { kind: string; percentUsed: number; resetsAt?: string }
 
+/** The weekly limit against a plan paced over five working days (see hooks/budget.ts). */
+export type DashBudget = {
+  /** 1–5: the working day of the week; the fifth holds the weekend and the reset day. */
+  slot: number
+  /** Cumulative plan at the end of the slot, percent of the weekly limit. */
+  plan: number
+  /** Spent since the slot started, percent of the weekly limit. */
+  day: number
+  /** Weekly percent used, rounded. */
+  week: number
+  level: 'ok' | 'warn' | 'over'
+  resetsAt: string
+}
+
 export type DashBreakdownRow = { name: string; tokens: number; kind: string; color: string }
 
 export type DashContext = {
@@ -110,6 +124,7 @@ export type DashContext = {
   maxPercent?: number
   costUsd?: number
   rateLimits: DashRateLimit[]
+  budget?: DashBudget
   compactions: number
   lastCompaction?: { before?: number; after?: number; at: number }
   breakdown?: DashBreakdownRow[]

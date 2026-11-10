@@ -110,6 +110,27 @@ Linux), or at the path in `ACTIVITY_DASHBOARD_CHROME`. Without one, macOS's
 `cupsfilter` renders the markdown as plain text. Without either, the HTML report
 is written in the PDF's place and can be printed to PDF from any browser.
 
+## Weekly budget
+
+The weekly limit is paced over five working days. The week before the reset is
+cut into slots at the reset hour: the first four days are a slot each, the last
+three days one slot together (for a Monday-evening reset: Tue, Wed, Thu, Fri,
+then Sat–Mon). Each slot may spend 20 % of the weekly limit and an unused share
+carries over, so the plan at the end of slot n is n × 20 %.
+
+Under `limit 7d` the pane shows `today` — the spend since the slot started,
+against 20 % — and `week plan` — the weekly percent against the cumulative plan.
+Amber from 15 % a day or a week above plan, red from 20 % a day or a week more
+than 5 points above plan. Crossing 15 % and 20 % in a slot raises one
+notification each: a toast, a line in the log and a native banner (osascript on
+macOS, else your notification channel).
+
+The count lives in `~/.claude/usage-budget/state`, one line
+`<week>:<slot> <base> <last> <notified>`. A status line script can keep the same
+file, so the terminal and the desktop app share one count and each
+notification is raised once. Usage on claude.ai or with no session open counts
+toward the slot in which a session next measures it.
+
 ## Sections of the pane
 
 - **NOW** — one row per live loop: `main` and every running agent, indented under
@@ -135,7 +156,8 @@ is written in the PDF's place and can be printed to PDF from any browser.
 - **CONTEXT** — window fill bar (green, amber, red by threshold), tokens and
   window size, autocompact threshold, peak fill, compaction count with the last
   before → after, and the window broken down by category.
-- **Rate limits and cost** — the 5h and 7d windows with reset times; total USD,
+- **Rate limits and cost** — the 5h and 7d windows with reset times, the weekly
+  budget (`today`, `week plan`; see Weekly budget); total USD,
   last-turn delta and average per turn.
 - **TOKENS** — uncached input, cache read, cache write, output; cache hit rate,
   call count, output-to-input ratio; then each model's share, calls and hit rate.

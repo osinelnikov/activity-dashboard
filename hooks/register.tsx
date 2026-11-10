@@ -4,12 +4,14 @@ import type { EngineInterface, ModelUsage, Register, RenderNode, SessionUsage } 
 import type {
   DashActiveTool,
   DashAgent,
+  DashBudget,
   DashContext,
   DashEvent,
   DashFile,
   DashMain,
   DashModelUsage,
   DashNow,
+  DashRateLimit,
   DashSkill,
   DashStep,
   DashTime,
@@ -47,6 +49,7 @@ import {
   total,
   untilIso,
 } from './format'
+import { BUDGET_TITLE, DAILY_SHARE, SLOTS, WARN_AT, budgetNotice, formatBudgetState, parseBudgetState, stepBudget } from './budget'
 import { MAIN, agentLabel, changedLines, describeNow, extractChanges, fmtFilePct, lineCount, loopLabel, mergeFile, relPath, sinceText, skillBadge } from './activity'
 import { meterRow, nextChartMode, paletteOf, shareChart, textBar } from './charts'
 import type { ChartOptions, ChartTable, Slice } from './charts'
@@ -405,6 +408,48 @@ const loadRecords = async ($: EngineInterface): Promise<SessionRecord[]> => {
     }
   }
   return recs.sort((a, b) => b.startedAt - a.startedAt)
+}
+
+// ---------------------------------------------------------------------------
+// Weekly budget: the state file is the status line script's, so both keep one count
+// ---------------------------------------------------------------------------
+
+const budgetStatePath = async ($: EngineInterface): Promise<string> => `${(await homeDir($)).replace(/\/+$/, '')}/.claude/usage-budget/state`
+
+const appleString = (s: string): string => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+
+const raiseBudgetNotice = async ($: EngineInterface, b: DashBudget, now: number) => {
+  const text = budgetNotice(b)
+  await pushEvent($, now, `budget: today ${String(b.day)}% of ${String(DAILY_SHARE)}%, week ${String(b.week)}% of plan ${String(b.plan)}%`, 'warn')
+  $.ui.toast(text)
+  // The desktop app has no terminal for $.ui.notify's channel, so on macOS the banner goes through osascript.
+  try {
+    if (await $.fs.exists('/usr/bin/osascript')) {
+      await $.process.run(['/usr/bin/osascript', '-e', `display notification ${appleString(text)} with title ${appleString(BUDGET_TITLE)}`], { timeoutMs: 5000 })
+      return
+    }
+  } catch {
+    // falls back to the person's notification channel
+  }
+  await $.ui.notify(text, { title: BUDGET_TITLE }).catch(() => undefined)
+}
+
+const applyBudget = async ($: EngineInterface, limits: readonly DashRateLimit[], now: number) => {
+  const weekly = limits.find(r => r.kind === 'seven_day')
+  const resetsAt = weekly?.resetsAt ? Date.parse(weekly.resetsAt) : Number.NaN
+  if (!weekly || !Number.isFinite(resetsAt)) return
+  try {
+    const path = await budgetStatePath($)
+    const text = (await $.fs.exists(path)) ? await $.fs.read(path) : ''
+    const prev = typeof text === 'string' ? parseBudgetState(text) : undefined
+    const step = stepBudget(weekly.percentUsed, resetsAt, now, prev)
+    const line = formatBudgetState(step.state)
+    if (!prev || formatBudgetState(prev) !== line) await $.fs.write(path, line)
+    await update($, contextAtom, c => ({ ...c, budget: step.budget }))
+    if (step.notify) await raiseBudgetNotice($, step.budget, now)
+  } catch {
+    // the budget is advisory: a state file that cannot be read or written leaves the pane as it was
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,6 +1180,7 @@ export const register: Register = (on, options) => {
     if (hot && e.changed.includes('rateLimits')) {
       await pushEvent($, now, `rate limit ${hot.kind} at ${hot.percentUsed}%`, 'warn')
     }
+    if (e.rateLimits.length) await applyBudget($, e.rateLimits, now)
     return next(e)
   })
 
@@ -1413,6 +1459,13 @@ export const register: Register = (on, options) => {
       for (const r of ctx.rateLimits) {
         const label = r.kind === 'five_hour' ? 'limit 5h' : r.kind === 'seven_day' ? 'limit 7d' : cut(r.kind, LABEL)
         rows.push(meterRow(t, label, r.percentUsed / 100, pctColor(r.percentUsed), `${padL(`${String(r.percentUsed)}%`, 5)}  ${untilIso(r.resetsAt, now)}`, LABEL, BAR))
+      }
+      if (ctx.budget) {
+        const b = ctx.budget
+        const dayColor = b.day >= DAILY_SHARE ? 'error' : b.day >= WARN_AT ? 'warning' : 'success'
+        const weekColor = b.level === 'over' ? 'error' : b.level === 'warn' ? 'warning' : 'success'
+        rows.push(meterRow(t, 'today', Math.min(1, b.day / DAILY_SHARE), dayColor, `${padL(`${String(b.day)}%`, 5)}  of ${String(DAILY_SHARE)}% · day ${String(b.slot)}/${String(SLOTS)}`, LABEL, BAR))
+        rows.push(meterRow(t, 'week plan', b.week / 100, weekColor, `${padL(`${String(b.week)}%`, 5)}  plan ${String(b.plan)}%`, LABEL, BAR))
       }
       if (ctx.costUsd !== undefined) {
         rows.push(

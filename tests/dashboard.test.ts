@@ -5,6 +5,8 @@ import { countHunks, describeNow, extractChanges, fmtFilePct, lineCount, mergeFi
 import { buildRecord, chatSummary, parseRecord, recordToHtml, recordToMarkdown } from '../hooks/report'
 import type { Snapshot } from '../hooks/report'
 import { expandPath, isPathLike, labelPath, parseReportArgs } from '../hooks/paths'
+import { formatBudgetState, parseBudgetState, stepBudget } from '../hooks/budget'
+import type { BudgetState, BudgetStep } from '../hooks/budget'
 
 const PANE_PROPS = {
   title: 'Activity',
@@ -287,4 +289,112 @@ test('a stream read only in part is closed beneath', async ($, on) => {
   expect((first.value as unknown as Record<string, unknown>).text).toBe('one')
   await it.return(undefined as never)
   expect(closed).toBe(true)
+})
+
+// ---------------------------------------------------------------------------
+// 0.4.0: weekly budget paced over five working days
+// ---------------------------------------------------------------------------
+
+/** A Monday 22:00 Kyiv reset, with the milliseconds the server reports. */
+const RESET = Date.parse('2026-11-16T20:00:00.144Z')
+
+test('the weekly budget paces the limit over five working days and carries the unused share', async () => {
+  let s: BudgetState | undefined
+  const step = (used: number, when: string, reset = RESET): BudgetStep => {
+    const r = stepBudget(used, reset, Date.parse(when), s)
+    s = r.state
+    return r
+  }
+  let r = step(12, '2026-11-10T08:00:00Z')
+  expect(r.budget).toMatchObject({ slot: 1, plan: 20, day: 12, week: 12, level: 'ok' })
+  expect(r.notify).toBe(0)
+  // the same key the status line script writes for this week and slot
+  expect(r.state.key).toBe('498572:1')
+
+  r = step(17.4, '2026-11-10T11:00:00Z', RESET + 7_000)
+  expect(r.budget).toMatchObject({ slot: 1, day: 17, level: 'warn' })
+  expect(r.notify).toBe(15)
+  r = step(17, '2026-11-10T13:00:00Z')
+  expect(r.notify).toBe(0)
+  r = step(19, '2026-11-10T19:59:00Z')
+  expect(r.budget).toMatchObject({ slot: 1, day: 19, level: 'warn' })
+
+  // Wednesday starts from the last value seen on Tuesday, and Tuesday's spare 1% carries into the plan
+  r = step(25, '2026-11-11T07:00:00Z')
+  expect(r.budget).toMatchObject({ slot: 2, plan: 40, day: 6, week: 25, level: 'ok' })
+  // a jump over both thresholds raises the alert alone
+  r = step(46, '2026-11-11T16:00:00Z')
+  expect(r.budget).toMatchObject({ day: 27, week: 46, level: 'over' })
+  expect(r.notify).toBe(20)
+
+  r = step(50, '2026-11-12T08:00:00Z')
+  expect(r.budget).toMatchObject({ slot: 3, plan: 60, day: 4, level: 'ok' })
+  r = step(62, '2026-11-12T18:00:00Z')
+  expect(r.budget).toMatchObject({ day: 16, week: 62, level: 'warn' })
+
+  // the weekend belongs to the slot that ends with the reset
+  r = step(70, '2026-11-14T10:00:00Z')
+  expect(r.budget).toMatchObject({ slot: 5, plan: 100, day: 8 })
+
+  // a new week starts from zero
+  r = step(1, '2026-11-16T20:30:00Z', RESET + 7 * 86_400_000)
+  expect(r.budget).toMatchObject({ slot: 1, plan: 20, day: 1, week: 1, level: 'ok' })
+})
+
+test('the budget state line is the status line script format', async () => {
+  const state: BudgetState = { key: '498573:2', base: 19, last: 46, notified: 20 }
+  expect(formatBudgetState(state)).toBe('498573:2 19 46 20\n')
+  expect(parseBudgetState('498573:2 19 46 20\n')).toEqual(state)
+  expect(parseBudgetState('')).toBeUndefined()
+  expect(parseBudgetState('week 1 2 3')).toBeUndefined()
+  expect(parseBudgetState('498573:2 a 46 20')).toBeUndefined()
+})
+
+test('a weekly measurement draws the budget, keeps the shared state file and notifies once per threshold', async ($, on) => {
+  mock.clock(on, { now: Date.parse('2026-11-11T16:00:00Z') })
+  mock.env(on, { HOME: '/home/me' })
+  const statePath = '/home/me/.claude/usage-budget/state'
+  const files: Record<string, string> = { [statePath]: '498572:1 0 19 15\n' }
+  const banners: string[] = []
+  const toasts: string[] = []
+  on('fs.exists', ($, e) => ({ value: e.path in files || e.path === '/usr/bin/osascript' }))
+  on('fs.read', ($, e) => ({ value: files[e.path] ?? '' }))
+  on('fs.write', ($, e) => {
+    files[e.path] = e.text
+    return { value: undefined }
+  })
+  on('process.run', ($, e) => {
+    if (e.argv[0] === '/usr/bin/osascript') banners.push(e.argv.join(' '))
+    return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.toast', ($, e) => {
+    toasts.push(e.text)
+    return { value: undefined }
+  })
+  on('session.measure', () => ({ changed: ['rateLimits'] }))
+  const measure = (percentUsed: number) =>
+    $.session.measure({
+      context: { window: 200_000 },
+      rateLimits: [{ kind: 'seven_day', percentUsed, resetsAt: '2026-11-16T20:00:00.144Z' }],
+      changed: ['rateLimits'],
+    })
+
+  // Tuesday ended at 19%: Wednesday's 46% is 27% for the day, past both thresholds
+  await measure(46)
+  expect(files[statePath]).toBe('498572:2 19 46 20\n')
+  expect(banners.length).toBe(1)
+  expect(banners[0]).toContain('Сегодня 27% недельного лимита')
+  expect(toasts.length).toBe(1)
+
+  await measure(47)
+  expect(files[statePath]).toBe('498572:2 19 47 20\n')
+  expect(banners.length).toBe(1)
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ plugin: 'activity-dashboard', surface, component: 'Pane', requestId: 'activity-dashboard', props: PANE_PROPS })
+    expect(await ui.find({ type: 'Text', text: /today/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /28%\s+of 20% · day 2\/5/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /plan 40%/ })).toBeDefined()
+    await ui.unmount()
+  }
 })
